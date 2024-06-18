@@ -13,6 +13,7 @@ from torch.autograd import Variable
 
 from xpos_relative_position import XPOS
 from rotary_embeddings import RotaryEmbedding
+from contextual_position_embeddings import CoPE
 from model_training import _shift_right, emb2idx, num_parameters, num_trainable_parameters
 from rmsnorm import RMSNorm
 
@@ -312,8 +313,9 @@ class SingleHeadQKV(nn.Module):
         self.group_norm = nn.GroupNorm(config.group_norm_num, config.group_norm_channels,
                                        eps=config.retention_group_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        #T = config.max_position_embeddings
+        T = config.max_position_embeddings
         #self.att_bias = nn.Parameter(torch.randn(T, T) / T)
+        self.cope = CoPE(T, self.inter_size)
 
     def _qkv(self, X_Q, X_KV, offset):
         if X_KV is None:
@@ -337,7 +339,7 @@ class SingleHeadQKV(nn.Module):
         B, T = out.shape[:2]
         out = self.dropout(out)
         out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
-        #out = out.transpose(-2, -1).contiguous().view(B, T, self.out_size)
+        out = out.transpose(-2, -1).contiguous().view(B, T, self.out_size)
         return out
 
     def forward_parallel(self, X_Q, X_KV=None, att_mask=None, offset=0):
@@ -345,12 +347,17 @@ class SingleHeadQKV(nn.Module):
         Q, K, V = self._qkv(X_Q, X_KV, offset)
         A = Q @ K.transpose(-2, -1)
         if self.apply_attention_mask:
+            if att_mask is None:
+                att_mask = torch.ones(B, T).to(X_Q.device).triu()#.transpose(-2, -1)
             #A *= att_mask.view(B, 1, T).repeat(1, T, 1)
-            A *= att_mask.view(B, T, 1).repeat(1, 1, T)
+            A *= att_mask.view(B, T, 1).repeat(1, 1, T).transpose(-2, -1)
         if self.apply_decay:
             D = _get_D(self.gamma, T).unsqueeze(0).to(X_Q.device)
             A *= D#.transpose(-2, -1)
         
+        #A = F.softmax(A, -1)
+        #A += self.cope(Q, A)
+
         #A += self.att_bias
         out = A @ V
         out = self._out(X_Q, out) 
@@ -449,6 +456,7 @@ class MultiQueryQKV(nn.Module):
                                        eps=config.retention_group_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.proj_G = nn.Linear(in_size, out_size)
+        self.cope = CoPE(config.max_position_embeddings, self.inter_size)
 
     def _qkv(self, X_Q, X_KV, offset):
         if X_KV is None:
@@ -474,13 +482,15 @@ class MultiQueryQKV(nn.Module):
         B, T = out.shape[:2]
         out = self.dropout(out)
         out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
-        #out = out.transpose(-2, -1).contiguous().view(*out.shape[:-1], self.out_size)
+        out = out.transpose(-2, -1).contiguous().view(*out.shape[:-1], self.out_size)
         return out
 
     def forward_parallel(self, X_Q, X_KV=None, att_mask=None, offset=0):
         B, T, C = X_Q.shape
         #U = self.proj_G(X_Q)
         Qs, K, V = self._qkv(X_Q, X_KV, offset)
+        #K = (1 / self.inter_size)**.5 * K
+        #V = (1 / self.inter_size)**.5 * V
         #A = Q @ K.transpose(-2, -1)
 
         As = torch.einsum("nbtc, bco -> nbto", Qs, K.transpose(-2, -1))
@@ -492,13 +502,19 @@ class MultiQueryQKV(nn.Module):
         if self.apply_decay:
             D = _get_D(self.gamma, T).view(1, 1, T, T).to(X_Q.device)
             As *= D#.transpose(-2, -1)
-        #As = As.sum(0)
-        As = As.transpose(-2, -1)
+
+        #As = (As + self.cope(Qs, As)) #/ self.inter_size ** .5
+
+        As = As.sum(0)
+        #As *= F.sigmoid(self.proj_G(X_Q))
+        #As = As.transpose(-2, -1)
         #A += self.att_bias
+        #As = As.sum(0)
         out = As @ V
         #out = torch.einsum("nbtc, bto -> nbto", As, V)
         #out *= U
-        out = out.sum(0)
+        #out *= F.softmax(self.proj_G(X_Q), 0)
+        #out = out.sum(0)
         out = self._out(X_Q, out)#.sum(0)
         return out
 
@@ -513,7 +529,7 @@ class MultiQueryQKV(nn.Module):
             inner_chunk *= att_mask.view(B, T, 1).repeat(1, 1, T)#.bool()).float()
         if self.apply_decay:
             inner_chunk *= D.unsqueeze(0)
-        inner_chunk = (inner_chunk @ V)#.sum(0)
+        inner_chunk = (inner_chunk @ V).sum(0)
 
         R_i = (K.transpose(-2, -1) @ (V * D[-1].view(1, T, 1))) + (S_n * (self.gamma ** T))
         e = torch.zeros(B, T, 1).to(X_Q.device)
@@ -521,8 +537,9 @@ class MultiQueryQKV(nn.Module):
             e[..., i, :] = self.gamma ** (i + 1)
         #cross_chunk = (Q @ S_n) * e
         cross_chunk = torch.einsum("nbtc, bco -> nbto", Qs, S_n) * e
+        cross_chunk = cross_chunk.sum(0)
 
-        out = (inner_chunk + cross_chunk).sum(0)
+        out = (inner_chunk + cross_chunk)#.sum(0)
         out = self._out(X_Q, out)
         return out, R_i
 
@@ -630,10 +647,219 @@ class MHeadQKV(nn.Module):
             raise ValueError(self.config.forward_method)
 
 
-#__QKV_CLASS__ = SingleHeadQKV
+
+class i2D_QKV(nn.Module):
+    def __init__(self, config, gamma, in_size, inter_size, out_size, apply_decay_mask=None, apply_attention_mask=False):
+        super().__init__()
+        self.config = config
+        self.gamma = gamma
+        self.in_size = in_size
+        self.out_size = out_size
+        self.inter_size = in_size
+        self.apply_decay = apply_decay_mask if apply_decay_mask is not None else config.apply_decay
+        self.W_Q = nn.Parameter(torch.randn(self.in_size, self.inter_size) / self.in_size)
+        self.W_K = nn.Parameter(torch.randn(self.in_size, self.inter_size) / self.in_size)
+        self.W_V = nn.Parameter(torch.randn(self.in_size, self.inter_size) / self.in_size)
+        self.W_proj = nn.Parameter(torch.randn(self.inter_size, self.out_size) / self.inter_size)
+        self.proj_bias = nn.Parameter(torch.randn(self.out_size) / self.out_size)
+        self.rope = RotaryEmbedding(config.rope_dim)
+        self.xpos = XPOS(self.inter_size)
+        self.act = get_act_func(config.hidden_retention_act)
+        self.out_act = get_act_func(config.hidden_out_act)
+        self.group_norm = nn.GroupNorm(config.group_norm_num, config.group_norm_channels,
+                                       eps=config.retention_group_norm_eps)
+        self.layer_norm = nn.LayerNorm(self.out_size, eps=config.layer_norm_eps)
+        self.rms_norm = RMSNorm(self.out_size, eps=config.rms_norm_eps)                                   
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+    def _qkv(self, X_Q, X_K, X_V, offset):
+        Q = X_Q @ self.W_Q
+        K = (X_Q @ self.W_K) if X_K is None else (X_K @ self.W_K)
+        V = (X_Q @ self.W_V) if X_V is None else (X_V @ self.W_V)
+        
+        Q = self.rope.rotate_queries_or_keys(Q, offset=offset)
+        K = self.rope.rotate_queries_or_keys(K, offset=offset)
+        #Q = self.xpos(Q)
+        #K = self.xpos(K, downscale=True)
+
+        if self.act is not None:
+            Q = self.act(Q)
+            K = self.act(K)
+            V = self.act(V)
+        return Q, K, V
+        
+    def _out(self, X_Q, out):
+        B, T = out.shape[:2]
+        out = self.dropout(out)
+        out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
+        #out = out.transpose(-2, -1).contiguous().view(B, T, self.out_size)
+        return out
+
+    def forward_parallel(self, X_Q, X_K=None, X_V=None, att_mask=None, offset=0):
+        B, T, C = X_Q.shape
+        Q, K, V = self._qkv(X_Q, X_K, X_V, offset)
+        A = Q @ K.transpose(-2, -1)
+        if self.apply_decay:
+            D = _get_D(self.gamma, T).unsqueeze(0).to(X_Q.device)
+            A *= D
+            #A *= self.gamma
+        #A = F.softmax(A / math.sqrt(self.inter_size), -1)
+        out = A @ V
+        out = self._out(X_Q, out)
+        return out
+
+    def forward_chunkwise(self, X_Q, X_K=None, X_V=None, S_n=None, att_mask=None, offset=0):
+        B, T, C = X_Q.shape
+        Q, K, V = self._qkv(X_Q, X_K, X_V, offset)
+        D = _get_D(self.gamma, T).to(X_Q.device)
+        R_i = (K.transpose(-2, -1) @ (V * D[-1].view(1, T, 1))) + (S_n * (self.gamma ** T))
+        
+        inner_chunk = Q @ K.transpose(-2, -1)
+        if self.apply_decay:
+            inner_chunk *= D.unsqueeze(0)
+        inner_chunk @= V
+
+        e = torch.zeros(B, T, 1).to(X_Q.device)
+        for i in range(T):
+            e[..., i, :] = self.gamma ** (i + 1)
+        cross_chunk = (Q @ S_n) * e
+
+        out = inner_chunk + cross_chunk
+        out = self._out(X_Q, out)
+        return out, R_i
+
+    def forward(self, X_Q, X_KV=None, S_n=None, att_mask=None, offset=0):
+        if self.config.forward_method == "parallel":
+            y = self.forward_parallel(X_Q, X_KV, X_KV, att_mask, offset)
+            return y, S_n
+        elif self.config.forward_method == "chunkwise":
+            if not self.config.local_recurrence_check:
+                return self.forward_chunkwise(X_Q, X_K, X_V, S_n, att_mask, offset)
+            T = X_Q.shape[1]
+            assert (T % self.config.num_local_chunks) == 0, f"{T} % {self.config.num_local_chunks} != 0"
+            nc_step = T // self.config.num_local_chunks
+            ret = []
+            for i in range(0, T, nc_step):
+                os = i + offset
+                u = j + nc_step
+                am = att_mask[:, j:u] if att_mask is not None else None
+                qi = X_Q[:, j:u, :] if X_Q is not None else None
+                ki = X_K[:, j:u, :] if X_K is not None else None
+                vi = X_V[:, j:u, :] if X_V is not None else None
+                y, S_n = self.forward_chunkwise(qi, ki, vi, S_n, am, os)
+                ret.append(y)
+            y = torch.cat(ret, 1)
+            y_par = self.forward_parallel(X_Q, X_KV, X_KV, att_mask, offset)
+            print("local check:", torch.allclose(y, y_par, atol=1e-5))
+            return y, S_N
+        else:
+            raise ValueError(f"unknown forward method '{self.config.forward_method}'")
+
+
+class HStateQKV(nn.Module):
+    def __init__(self, config, gamma, in_size, inter_size, out_size, apply_decay_mask=None, apply_attention_mask=False):
+        super().__init__()
+        self.config = config
+        self.gamma = gamma
+        self.apply_attention_mask = apply_attention_mask
+        self.apply_decay = apply_decay_mask if apply_decay_mask is not None else config.apply_decay
+        self.in_size = in_size
+        self.inter_size = inter_size
+        self.out_size = out_size
+
+        self.proj_Q = nn.Linear(self.in_size, self.inter_size)
+        self.proj_K = nn.Linear(self.in_size, self.inter_size)
+        self.proj_V = nn.Linear(self.in_size, self.out_size)
+        #self.input_gate = nn.Linear(self.in_size, self.inter_size)
+        self.input_gate = nn.Linear(self.in_size, config.max_position_embeddings)
+        #self.forget_gate = nn.Linear(self.in_size, self.inter_size)
+        self.forget_gate = nn.Linear(self.in_size, config.max_position_embeddings)
+        self.output_gate = nn.Linear(self.in_size, self.out_size)
+
+        self.rope = RotaryEmbedding(config.rope_dim)
+        self.xpos = XPOS(self.inter_size)
+        self.act = get_act_func(config.hidden_retention_act)
+        self.out_act = get_act_func(config.hidden_out_act)
+        self.group_norm = nn.GroupNorm(config.group_norm_num, config.group_norm_channels,
+                                       eps=config.retention_group_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+    def forward(self, X_Q, X_KV=None, S_n=None, att_mask=None, offset=0):
+        Q = self.proj_Q(X_Q)
+        K = self.proj_K(X_KV)
+        V = self.proj_V(X_KV)
+        
+        Q = self.rope.rotate_queries_or_keys(Q)
+        K = self.rope.rotate_queries_or_keys(V)
+
+        Q = self.act(Q)
+        K = self.act(K)
+        V = self.act(V)
+
+        h, C = S_n
+
+        """
+        i = self.input_gate(X_Q)
+        i = torch.exp(i)
+
+        f = self.forget_gate(X_Q)
+        f = torch.exp(f)
+
+        print(f.shape, C.shape)
+        C_t = f * C 
+        print(i.shape, (K.transpose(-2, -1) @ V).shape)
+        C_t += i * (K.transpose(-2, -1) @ V)
+        attn = Q @ C_t
+
+        o = self.output_gate(h)
+        o = F.sigmoid(o)
+
+        y = o * attn
+        y = self.dropout(y)
+        """
+        """
+        i = self.input_gate(X_Q)
+        i = torch.exp(i)
+
+        f = self.forget_gate(X_Q)
+        f = torch.exp(f)
+
+        D_tilde = torch.log(f) + i
+        m = D_tilde.max(dim=-1).values
+        
+        #print(D_tilde.shape, m.shape)
+
+        D_ = torch.exp(D_tilde - m.unsqueeze(-1))
+        C_t = (Q @ K.transpose(-2, -1)) / (self.inter_size ** .5)
+        #print(C_t.shape, D_.shape)
+        C_t *= D_
+
+        b = C_t.sum(-1)
+        n = torch.maximum(torch.abs(b), torch.exp(-m))
+        
+        #C_t = C_t * (n**-1).unsqueeze(-1)
+        #print(C_t.shape, V.shape)
+        y = C_t @ V
+
+        return y, [h, C_t]
+        """
+
+        out = Q @ K.transpose(-2, -1) 
+
+        out = out.transpose(-2, -1) @ V
+
+        out = self.dropout(out)
+        out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
+
+        return out, S_n
+
+
+__QKV_CLASS__ = SingleHeadQKV
 #__QKV_CLASS__ = MultiHeadQKV
-__QKV_CLASS__ = MultiQueryQKV
+#__QKV_CLASS__ = MultiQueryQKV
 #__QKV_CLASS__ = MHeadQKV
+#__QKV_CLASS__ = i2D_QKV
+#__QKV_CLASS__ = HStateQKV
 
 
 class EfficientChannelAttention(nn.Module):
@@ -681,6 +907,24 @@ class SkipAt(nn.Module):
         return nd
 
 
+class AANFFN(nn.Module):
+    def __init__(self, io_size, layer_norm_eps):
+        super().__init__()
+        self.io_size = io_size
+        self.inter_size = 3072
+        self.core = nn.Sequential(
+            nn.Linear(self.io_size, self.inter_size),
+            nn.GELU(),
+            nn.Linear(self.inter_size, self.io_size)
+        )
+        self.norm = nn.LayerNorm(io_size, eps=layer_norm_eps)
+
+    def forward(self, X):
+        y = self.core(X)
+        y = self.norm(y + X)
+        return y
+
+
 class COINBlock(nn.Module):
     def __init__(self, config, gamma, in_size, inter_size, out_size, is_decoder=False, is_cross_encoder=False):
         super().__init__()
@@ -694,22 +938,33 @@ class COINBlock(nn.Module):
             self.cross_norm = nn.LayerNorm(out_size, eps=config.layer_norm_eps)
         self.qkv = __QKV_CLASS__(config, gamma, in_size, inter_size, out_size, apply_attention_mask=is_decoder)#, apply_decay_mask=is_decoder)
         self.norm = nn.LayerNorm(out_size, eps=config.layer_norm_eps)
+        #self.norm = RMSNorm(out_size, eps=config.rms_norm_eps)
         self.hidden_pos_offset = 0
+
+        #self.ffn = AANFFN(out_size, config.layer_norm_eps)
 
     def forward_encode(self, encoder_query, encoder_hidden_state, residual_query, S_n, att_mask, offset):
         B, T, C = encoder_query.shape
         if S_n is None or self.config.reset_S_n_state:
             S_n = torch.zeros(B, C, C).to(encoder_query.device)
+            #S_n = [
+            #    torch.zeros(B, C).to(encoder_query.device),
+            #    torch.zeros(B, C, C).to(encoder_query.device)
+            #]
             self.hidden_pos_offset = 0
         y, s_o = self.qkv(
             X_Q=encoder_query,
+            #X_KV=residual_query,
             #X_Q=encoder_hidden_state,
-            X_KV=encoder_hidden_state if self.is_cross_encoder else None,
+            #X_KV=encoder_hidden_state if self.is_cross_encoder else None,
             S_n=S_n,
             att_mask=att_mask,
             offset=offset
         )
         y = self.norm(y + encoder_query)
+
+        #y = self.ffn(y)
+
         return y, s_o
 
     def forward_decode(self, query, cross_query, encoder_hidden_state, residual_query, S_n, att_mask, offset):
@@ -731,6 +986,7 @@ class COINBlock(nn.Module):
             offset=offset
         )
         y = self.norm(y + query)
+
         r, s_o2 = self.cross_qkv(
             X_Q=y,
             X_KV=cross_query,
@@ -903,6 +1159,35 @@ class COINForSequenceClassification(COINPreTrainedModel):
         )
 
 
+class COINForHierachicalClassification(COINPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.coin = COINModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.loss_fn = nn.BCEWithLogitsLoss()
+        self.post_init()
+
+    def forward(self, input_ids, decoder_input_ids, encoder_hidden_state, S, C, inputs_embeds=None, decoder_inputs_embeds=None, attention_mask=None, offset=0, labels=None, **kwargs):
+        _, pooled_out, S, encoder_hidden_state = self.coin(input_ids, decoder_input_ids, encoder_hidden_state, S, inputs_embeds, decoder_inputs_embeds, attention_mask, offset, **kwargs)
+        logits = self.dropout(pooled_out)
+        logits = self.classifier(logits)
+        #loss = self.loss_fn(logits, labels) if labels is not None else None
+        l1_log, l2_log = logits.chunk(2, -1)
+        l1_lab, l2_lab = labels.chunk(2, -1)
+        l1_loss = self.loss_fn(l1_log, l1_lab) 
+        l2_loss = self.loss_fn(l2_log, l2_lab) 
+        loss = l1_loss + l2_loss
+        return COINOutputClass(
+            logits,
+            encoder_hidden_state,
+            S,
+            C,
+            loss
+        )
+
+
 class COINPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -968,9 +1253,71 @@ class COINForConditionalGeneration(COINPreTrainedModel):
         #decoder_input_ids = _shift_right(decoder_input_ids, self.config.decoder_start_token_id, self.config.pad_token_id)
         out, _, S, encoder_hidden_state = self.coin(input_ids, decoder_input_ids, encoder_hidden_state, S, inputs_embeds, decoder_inputs_embeds, attention_mask, offset, **kwargs)
         logits = self.lm_head(out)
-        loss = self.loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1)) if labels is not None else None
+        loss = self.loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1)) #if labels is not None else None
         #if aux_loss is not None:
         #    loss += aux_loss
+        return COINOutputClass(
+            logits,
+            encoder_hidden_state,
+            S,
+            C,
+            loss
+        )
+
+
+class COINForBucketSort(COINPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        #self.coin = COINModel(config)
+        self.embeddings = nn.Linear(config.vocab_size, config.hidden_size)
+        self.decoder_embeddings = nn.Linear(config.vocab_size, config.hidden_size)
+        self.stack = COINStack(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.post_init()
+
+    def forward(self, input_ids, decoder_input_ids, encoder_hidden_state, S, C, inputs_embeds=None, decoder_inputs_embeds=None, attention_mask=None, offset=0, labels=None, **kwargs):
+        #decoder_input_ids = _shift_right(decoder_input_ids, self.config.decoder_start_token_id, self.config.pad_token_id)
+        #logits, _, S, encoder_hidden_state = self.coin(input_ids, decoder_input_ids, encoder_hidden_state, S, inputs_embeds, decoder_inputs_embeds, attention_mask, offset, **kwargs)
+        #emb = F.one_hot(input_ids, num_classes=self.config.vocab_size).float()
+        #dec_emb = F.one_hot(decoder_input_ids, num_classes=self.config.vocab_size).float()
+        emb = self.embeddings(F.one_hot(input_ids, self.config.vocab_size).float())
+        dec_emb = self.decoder_embeddings(F.one_hot(decoder_input_ids, self.config.vocab_size).float())
+        logits, encoder_hidden_state, S = self.stack(emb, dec_emb, encoder_hidden_state, dec_emb, S, attention_mask, offset)
+        logits = self.lm_head(logits)
+        loss = self.loss_fn(logits.view(-1, logits.shape[-1]), labels.view(-1))
+        #loss = self.loss_fn(logits.view(-1, logits.shape[-1]), labels.argmax(-1).view(-1))
+        return COINOutputClass(
+            logits,
+            encoder_hidden_state,
+            S,
+            C, 
+            loss
+        )
+    
+
+class COINForParityCheck(COINPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.embeddings = nn.Linear(config.vocab_size, config.hidden_size)
+        self.decoder_embeddings = nn.Linear(config.vocab_size, config.hidden_size)
+        self.stack = COINStack(config)
+        self.pooler = COINPooler(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        self.loss_fn = nn.CrossEntropyLoss() if self.config.num_labels <= 2 else nn.BCEWithLogitsLoss()
+        self.post_init()
+    
+    def forward(self, input_ids, decoder_input_ids, encoder_hidden_state, S, C, inputs_embeds=None, decoder_inputs_embeds=None, attention_mask=None, offset=0, labels=None, **kwargs):
+        emb = self.embeddings(F.one_hot(input_ids, self.config.vocab_size).float())
+        dec_emb = self.decoder_embeddings(F.one_hot(decoder_input_ids, self.config.vocab_size).float())
+        logits, encoder_hidden_state, S = self.stack(emb, dec_emb, encoder_hidden_state, dec_emb, S, attention_mask, offset)
+        pooled_out = self.pooler(logits)
+        logits = self.dropout(pooled_out)
+        logits = self.classifier(logits)
+        loss = self.loss_fn(logits, labels) if labels is not None else None
         return COINOutputClass(
             logits,
             encoder_hidden_state,
