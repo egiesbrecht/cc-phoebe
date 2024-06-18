@@ -22,8 +22,9 @@ def hamming_score(y_true, y_pred, normalize=True, sample_weight=None):
 
 
 class EpochStats(JSONEncoder):
-    def __init__(self, name, id2label):
+    def __init__(self, name, id2label, chomsky_task=False):
         self.name = name
+        self.chomsky_task = chomsky_task
         self.id2label = id2label
         self.scores = {}
         self.scores_by_label = {}
@@ -72,7 +73,9 @@ class EpochStats(JSONEncoder):
     def flat_metrics(self, preds, labels, calc_scores_by_label=False, zd_val=1, one_label_only=True):
         #print(preds.shape, preds)
         #print(labels.shape, labels)
-        if one_label_only:
+        if self.chomsky_task:
+            y_pred = preds
+        elif one_label_only:
             y_pred = np.array([np.argmax(n) for n in preds])
         else:
             l_one_idxs = [np.where(n == 1)[0].tolist() for n in labels]
@@ -96,15 +99,22 @@ class EpochStats(JSONEncoder):
                 self.add_label_score("precision", lp, rec)
         #print(y_pred.shape, y_pred)
         #print(labels.shape, labels)
-        self.add_score("accuracy", accuracy_score(labels, y_pred))
-        if len(labels) > 2:
-            self.add_score("hamming", hamming_score(labels, y_pred))
-        self.add_score("f1_micro", f1_score(labels, y_pred, average="micro", zero_division=zd_val))
-        self.add_score("f1_macro", f1_score(labels, y_pred, average="macro", zero_division=zd_val))
-        self.add_score("recall_micro", recall_score(labels, y_pred, average="micro", zero_division=zd_val))
-        self.add_score("recall_macro", recall_score(labels, y_pred, average="macro", zero_division=zd_val))
-        self.add_score("precision_micro", precision_score(labels, y_pred, average="micro", zero_division=zd_val))
-        self.add_score("precision_macro", precision_score(labels, y_pred, average="macro", zero_division=zd_val))
+        
+        #y_pred = (y_pred == 0)#.int()
+
+        if self.chomsky_task:
+            self.add_score("accuracy", (y_pred == labels).mean())
+        else:
+            self.add_score("accuracy", accuracy_score(labels, y_pred))
+            if len(labels) > 2:
+                self.add_score("hamming", hamming_score(labels, y_pred))
+            self.add_score("per class f1", pc_f1(y_pred, labels, False, False))
+            self.add_score("f1_micro", f1_score(labels, y_pred, average="micro", zero_division=zd_val))
+            self.add_score("f1_macro", f1_score(labels, y_pred, average="macro", zero_division=zd_val))
+            self.add_score("recall_micro", recall_score(labels, y_pred, average="micro", zero_division=zd_val))
+            self.add_score("recall_macro", recall_score(labels, y_pred, average="macro", zero_division=zd_val))
+            self.add_score("precision_micro", precision_score(labels, y_pred, average="micro", zero_division=zd_val))
+            self.add_score("precision_macro", precision_score(labels, y_pred, average="macro", zero_division=zd_val))
 
 
 def flat_metrics(preds, labels, stats: EpochStats, calc_scores_by_label=False, zd_val=1):
@@ -124,3 +134,51 @@ def print_stat_tuples(stats):
         print(f"  Test:")
         print_scores(e)
         print()
+
+
+def pc_f1(y_pred, y_true, print_statistics=True, convert_predictions=True):
+    num_classes = y_true.shape[-1]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        if convert_predictions:
+            one_hot_pred = np.zeros((len(y_pred), num_classes))
+            one_hot_pred[np.arange(len(y_pred)), y_pred] = 1
+
+            #one_hot_gt = np.zeros((len(y_true), num_classes))
+            #one_hot_gt[np.arange(len(y_true)), y_true] = 1
+            one_hot_gt = y_true
+        else:
+            one_hot_pred = y_pred
+            one_hot_gt = y_true
+
+        actually_there = (np.sum(one_hot_gt, axis=0) > 0).astype("int32")
+
+        tp = np.sum(one_hot_pred * one_hot_gt, axis=0)
+        fp = np.sum(one_hot_pred * (1-one_hot_gt), axis=0)
+        tn = np.sum((1-one_hot_pred) * (1-one_hot_gt), axis=0)
+        fn = np.sum((1-one_hot_pred) * one_hot_gt, axis=0)
+
+        precision = tp / (tp + fp)
+        recall = tp / (fn + tp)
+        f1 = 2 * precision * recall / (precision + recall)
+        precision[np.isnan(precision)] = 0
+        recall[np.isnan(recall)] = 0
+        f1[np.isnan(f1)] = 0
+        accuracy = (tp + tn) / (tp + tn + fp + fn)
+
+        if print_statistics:
+            print("\nPer class metrics:")
+            print("  Class | Precision  |  Recall  |    F1   |  Accuracy")
+            for c in range(num_classes):
+                if actually_there[c] > 0:
+                    print(f"   {c:2d}   |   {precision[c]:.3f}    |  {recall[c]:.3f}   |  {f1[c]:.3f}  |   {accuracy[c]:.3f}")
+                else:
+                    print(f"    -   |     -      |    -     |    -    |     -   ")
+
+        macro_f1 = np.sum(f1*actually_there) / np.sum(actually_there)
+        if print_statistics:
+            print(f"Macro F1: {macro_f1}")
+
+        micro_precision = np.mean(np.sum(one_hot_gt * one_hot_pred, axis=1) / np.sum(one_hot_pred, axis=1))
+        micro_recall = np.mean(np.sum(one_hot_gt * one_hot_pred, axis=1) / np.sum(one_hot_gt, axis=1))
+        micro_f1 = 2 * micro_recall * micro_precision / (micro_recall + micro_precision)
+    return macro_f1

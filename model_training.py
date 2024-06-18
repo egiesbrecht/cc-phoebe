@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data.dataloader import DataLoader
 import time
 import datetime
@@ -588,10 +589,17 @@ class BatchBuffer:
             batch = {}
 
 
+# only a short term solution to avoid breaking legacy code
+STRING_BATCH_INDEX = False
+
+
 def _get_batch_item(batch, batch_schema, item, device):
     if item not in batch_schema:
         return None
-    idx = batch_schema.index(item)
+    if STRING_BATCH_INDEX:
+        idx = item
+    else:
+        idx = batch_schema.index(item)
     return batch[idx].to(device)
     
 
@@ -856,6 +864,7 @@ def train_set_epoch(
     mlm_decode_max_chars=100,
     mlm_decode_max_batch_output=2,
     check_run=False,
+    chomsky_task=False,
 ):
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
@@ -863,7 +872,7 @@ def train_set_epoch(
     if masked_lm_task and vocab_size is None:
         raise ValueError("vocab_size has to be specified when training for a masked lm task")
 
-    c_train_stats = EpochStats("train", id2label)
+    c_train_stats = EpochStats("train", id2label, chomsky_task)
     t0 = time.time()
     if check_run:
         print("CHECK RUN")
@@ -871,7 +880,12 @@ def train_set_epoch(
     else:
         model.train()
 
-    print_n = 50 if len(train_dataloader) > 10000 else (int(len(train_dataloader) / 40) if len(train_dataloader) > 400 else 20)
+    #print_n = (len(train_dataloader) / 50) if len(train_dataloader) > 10000 else (int(len(train_dataloader) / 40) if len(train_dataloader) > 400 else 20)
+    #if chomsky_task:
+    #    len_dl = len(train_dataloader) // batch_size 
+    #else:
+    len_dl = len(train_dataloader)
+    print_n = len_dl // 50 #if len_dl > 500 else 50
 
     mems = None
     S, C = None, None
@@ -879,6 +893,7 @@ def train_set_epoch(
 
     last_elapse = 0
     for step, batch in enumerate(train_dataloader):
+        #print(step, print_n, step % print_n)
         if print_status and (step % print_n == 0) and not step == 0:
             c_time = time.time()
             elapsed = c_time - t0
@@ -897,7 +912,7 @@ def train_set_epoch(
         #attention_mask = _get_batch_item(batch, batch_schema, "attention_mask", device)
         model_args = _get_model_args(batch, batch_schema, forward_args, device)
         #print(forward_args)
-        #print(model_args)
+        #print(model_args.keys())
 
         if imitation_model is not None:
             with torch.no_grad():
@@ -916,7 +931,9 @@ def train_set_epoch(
 
         model.zero_grad()
         if is_hf_model:
-            logits = model(**model_args).logits
+            outputs = model(**model_args)
+            logits = outputs.logits
+            loss = outputs.loss
             aux_loss = None
         elif generic_output_class:
             outputs = model(
@@ -1019,6 +1036,16 @@ def train_set_epoch(
             if aux_loss is not None:
                 loss += aux_loss
 
+        if chomsky_task:
+            logits = logits.argmax(-1)
+        #logits = F.one_hot(logits, vocab_size)
+        #print(logits.shape, labels.shape)
+        #print(logits.dtype, labels.dtype)
+        #print(logits[0])
+        #print(labels[0])
+        #acc_2 = (logits == labels).float().mean().item()
+        #c_train_stats.add_score("accuracy_2", acc_2)
+
         logits = logits.detach().cpu().numpy()
         labels = labels.detach().cpu().numpy()
         
@@ -1067,7 +1094,8 @@ def test_set_epoch(
     batch_hack=False,
     causal_lm=False,
     generic_output_class=False,
-    forward_args=["input_ids", "token_type_ids", "attention_mask", "decoder_input_ids", "labels"]
+    forward_args=["input_ids", "token_type_ids", "attention_mask", "decoder_input_ids", "labels"],
+    chomsky_task=False,
 ):
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
@@ -1075,7 +1103,7 @@ def test_set_epoch(
     if masked_lm_task and vocab_size is None:
         raise ValueError("vocab_size has to be specified when testing for a masked lm task")
 
-    c_test_stats = EpochStats("test", id2label)
+    c_test_stats = EpochStats("test", id2label, chomsky_task)
     t0 = time.time()
     model.eval()
 
@@ -1101,7 +1129,9 @@ def test_set_epoch(
 
         with torch.no_grad():
             if is_hf_model:
-                logits = model(**model_args).logits
+                outputs = model(**model_args)
+                logits = outputs.logits
+                loss = outputs.loss
                 aux_loss = None
             elif generic_output_class:
                 outputs = model(
@@ -1155,6 +1185,9 @@ def test_set_epoch(
             
             if aux_loss is not None:
                 loss += aux_loss
+
+        if chomsky_task:
+            logits = logits.argmax(-1)
 
         logits = logits.detach().cpu().numpy()
         labels = labels.detach().cpu().numpy()
@@ -1222,6 +1255,7 @@ def train_bern_model(
     dump_coin_regions=False,
     coin_region_lambda=None,
     check_run=False,
+    chomsky_task=False,
 ):
     assert train_dataloader is not None or create_train_dataloader is not None
     assert test_dataloader is not None or create_test_dataloader is not None
@@ -1289,6 +1323,7 @@ def train_bern_model(
             mlm_decode_max_chars,
             mlm_decode_max_batch_output,
             check_run,
+            chomsky_task
         )
         train_stats.append(c_train_stats)
 
@@ -1316,7 +1351,8 @@ def train_bern_model(
             batch_hack_test,
             causal_lm,
             generic_output_class,
-            forward_args
+            forward_args,
+            chomsky_task
         )
         test_stats.append(c_test_stats)
         
