@@ -10,7 +10,7 @@
 ## COIN i3c
 base 8 layer decoder config, no pretraining <br>
 .86 / .69 epoch 3 <br>
-full log at hyp_cls/COIN-i3c-base_all-labels/
+[full log](hyp_cls/COIN-i3c-base_all-labels/)
 
 ## DeBERTa base
 .88 / .68 epoch 7 <br>
