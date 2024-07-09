@@ -1,11 +1,11 @@
 # Benchmarks using all 3 subcategories if available
 
-B = 1
-T = 512
-lr = 1e-4, 3e-4, 6e-4, 1e-5
+- B = 1
+- T = 512
+- lr = 1e-4, 3e-4, 6e-4, 1e-5
 
-train-score / test-score
-f1 per class
+- train-score / test-score
+- f1 per class
 
 ## COIN i3c
 base 8 layer decoder config, no pretraining
