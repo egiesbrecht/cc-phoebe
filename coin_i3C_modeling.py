@@ -317,6 +317,12 @@ class SingleHeadQKV(nn.Module):
         #self.att_bias = nn.Parameter(torch.randn(T, T) / T)
         self.cope = CoPE(T, self.inter_size)
 
+        self.num_actions = 3
+        self.W_ac = nn.Parameter(torch.randn(self.in_size, self.num_actions) / self.in_size)
+        self.ac_bias = nn.Parameter(torch.randn(self.num_actions))
+        self.max_turns = 4
+        self.turn_threshold = 0.5
+
     def _qkv(self, X_Q, X_KV, offset):
         if X_KV is None:
             K = X_Q @ self.W_K
@@ -385,9 +391,32 @@ class SingleHeadQKV(nn.Module):
         out = self._out(X_Q, out)
         return out, R_i
 
+    def parallel_action(self, X_Q, X_KV, att_mask, offset, n_turn=0):
+        if n_turn >= self.max_turns :#or X_Q.mean() < self.turn_threshold:
+            return self.forward_parallel(X_Q, X_KV, att_mask, offset)
+
+        actions = X_Q @ self.W_ac #+ self.ac_bias
+        actions = F.softmax(actions, -1)
+        
+        repeat = actions[..., 0]
+        return_state = actions[..., 1]
+        noop = actions[..., 2]
+
+        repeat_Q = X_Q * repeat.unsqueeze(-1)
+        #repeat_KV = X_KV * repeat.unsqueeze(-1)
+        return_Q = X_Q * return_state.unsqueeze(-1)
+        #return_KV = X_KV * return_state.unsqueeze(-1)
+        noop_Q = X_Q * noop.unsqueeze(-1)
+
+        out = self.forward_parallel(return_Q, X_KV, att_mask, offset)
+        out += self.parallel_action(repeat_Q, X_KV, att_mask, offset, n_turn+1)
+        out += noop_Q
+        return out
+
     def forward(self, X_Q, X_KV=None, S_n=None, att_mask=None, offset=0):
         if self.config.forward_method == "parallel":
             y = self.forward_parallel(X_Q, X_KV, att_mask, offset)
+            #y = self.parallel_action(X_Q, X_KV, att_mask, offset)
             return y, S_n
         elif self.config.forward_method == "chunkwise":
             return self.forward_chunkwise(X_Q, X_KV, S_n, att_mask, offset)

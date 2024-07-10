@@ -16,22 +16,6 @@ from datasets import Dataset
 from transformers.utils import is_torch_fx_proxy
 
 
-def segment_sum(data, indices, num_segments=None):
-    assert data.shape == indices.shape, f"{data.shape} != {indices.shape}"
-    if num_segments is None:
-        num_segments = indices.max().item()
-    size = (num_segments,) * indices.dim()
-    return torch.zeros(size).to(data.dtype).scatter_reduce(-1, indices, data, "sum")
-
-
-def segment_prod(data, indices, num_segments=None):
-    assert data.shape == indices.shape, f"{data.shape} != {indices.shape}"
-    if num_segments is None:
-        num_segments = indices.max().item()
-    size = (num_segments,) * indices.dim()
-    return torch.ones(size).to(data.dtype).scatter_reduce(-1, indices, data, "prod")
-
-
 def _doc_pad(examples, max_length, pad_token=0, doc_token=4):
     ret = {}
     for k, v in examples.items():
@@ -881,7 +865,6 @@ def train_set_epoch(
     mlm_decode_max_batch_output=2,
     check_run=False,
     chomsky_task=False,
-    accuracy_mask=None,
 ):
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
@@ -889,7 +872,7 @@ def train_set_epoch(
     if masked_lm_task and vocab_size is None:
         raise ValueError("vocab_size has to be specified when training for a masked lm task")
 
-    c_train_stats = EpochStats("train", id2label, chomsky_task, accuracy_mask)
+    c_train_stats = EpochStats("train", id2label, chomsky_task)
     t0 = time.time()
     if check_run:
         print("CHECK RUN")
@@ -903,7 +886,6 @@ def train_set_epoch(
     #else:
     len_dl = len(train_dataloader)
     print_n = len_dl // 50 #if len_dl > 500 else 50
-    print_n = max(1, print_n)
 
     mems = None
     S, C = None, None
@@ -911,7 +893,7 @@ def train_set_epoch(
 
     last_elapse = 0
     for step, batch in enumerate(train_dataloader):
-        #print(step, print_n, len_dl)#, step % print_n)
+        #print(step, print_n, step % print_n)
         if print_status and (step % print_n == 0) and not step == 0:
             c_time = time.time()
             elapsed = c_time - t0
@@ -951,8 +933,7 @@ def train_set_epoch(
         if is_hf_model:
             outputs = model(**model_args)
             logits = outputs.logits
-            if hasattr(outputs, "loss"):
-                loss = outputs.loss
+            loss = outputs.loss
             aux_loss = None
         elif generic_output_class:
             outputs = model(
@@ -1093,8 +1074,6 @@ def train_set_epoch(
 
 def test_set_epoch(
     model: nn.Module,
-    optimizer,
-    scheduler,
     test_dataloader: Union[DataLoader, BatchBuffer],
     batch_schema: List[str],
     device,
@@ -1117,8 +1096,6 @@ def test_set_epoch(
     generic_output_class=False,
     forward_args=["input_ids", "token_type_ids", "attention_mask", "decoder_input_ids", "labels"],
     chomsky_task=False,
-    accuracy_mask=None,
-    backprop_during_testing=False,
 ):
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
@@ -1126,7 +1103,7 @@ def test_set_epoch(
     if masked_lm_task and vocab_size is None:
         raise ValueError("vocab_size has to be specified when testing for a masked lm task")
 
-    c_test_stats = EpochStats("test", id2label, chomsky_task, accuracy_mask)
+    c_test_stats = EpochStats("test", id2label, chomsky_task)
     t0 = time.time()
     model.eval()
 
@@ -1185,8 +1162,6 @@ def test_set_epoch(
                     C = _detach_hidden_states(C)
 
         if loss is None:
-            if backprop_during_testing:
-                raise ValueError("when using backprop during testing loss has to be deliviered by model output and should not be None")
             if masked_lm_task:
                 if causal_lm:
                     logits = logits[:, :-1, :].contiguous()
@@ -1221,14 +1196,6 @@ def test_set_epoch(
         if not masked_lm_task and not electra_task and calc_metrics:
             c_test_stats.flat_metrics(logits, labels, one_label_only=one_label_only)
 
-        if backprop_during_testing:
-            loss.backward()#retain_graph=retain_graph)
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            optimizer.step()
-            scheduler.step()
-        
         if empty_cache:
             torch.cuda.empty_cache()
 
@@ -1289,8 +1256,6 @@ def train_bern_model(
     coin_region_lambda=None,
     check_run=False,
     chomsky_task=False,
-    accuracy_mask=None,
-    backprop_during_testing=False,
 ):
     assert train_dataloader is not None or create_train_dataloader is not None
     assert test_dataloader is not None or create_test_dataloader is not None
@@ -1358,8 +1323,7 @@ def train_bern_model(
             mlm_decode_max_chars,
             mlm_decode_max_batch_output,
             check_run,
-            chomsky_task,
-            accuracy_mask
+            chomsky_task
         )
         train_stats.append(c_train_stats)
 
@@ -1367,8 +1331,6 @@ def train_bern_model(
             print("\nRunning Testing...")
         c_test_stats = test_set_epoch(
             model,
-            optimizer,
-            scheduler,
             test_dataloader,
             batch_schema,
             device,
@@ -1390,9 +1352,7 @@ def train_bern_model(
             causal_lm,
             generic_output_class,
             forward_args,
-            chomsky_task,
-            accuracy_mask,
-            backprop_during_testing
+            chomsky_task
         )
         test_stats.append(c_test_stats)
         

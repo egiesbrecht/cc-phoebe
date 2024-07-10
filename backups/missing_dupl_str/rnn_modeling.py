@@ -11,7 +11,6 @@ import math
 import numpy as np
 from rotary_embeddings import RotaryEmbedding
 from contextual_position_embeddings import CoPE
-import snntorch as snn
 
 
 @dataclass
@@ -31,8 +30,6 @@ class RNNConfig:
     layer_norm_eps: float = 1e-12
     rope_dim: int = 32
     layer_norm_eps: float = 1e-12
-    carry_over_S: bool = False,
-    chunk_schema: List[int] = None
 
 
 @dataclass
@@ -188,47 +185,9 @@ class COINBlock(nn.Module):
         self.W_Q = nn.Parameter(torch.randn(I, C) / I)
         self.W_K = nn.Parameter(torch.randn(I, C) / I)
         self.W_V = nn.Parameter(torch.randn(I, I) / I)
-        self.b_Q = nn.Parameter(torch.randn(C) / C)
-
-        self.E = nn.Parameter(torch.randn(C, C) )#/ C)
-
-        self.W_tape_action = nn.Parameter(torch.randn(C, 5))
-
-        self.W_h_back = nn.Parameter(torch.randn(C, C) / C)
-        self.W_chunk_select = nn.Parameter(torch.randn(C, C) / C)
-
-        self.vocab_fc = nn.Linear(C, config.vocab_size)
-
-        self.leaky_spike = snn.Leaky(0.5)
-        self.atan = snn.LeakyParallel.ATan.apply
-
-        self.W_chunk_mask = nn.Parameter(torch.randn(C, 2) / 2)
-        self.A_mask = nn.Parameter(torch.randn(C))
-        max_chunk_len = 20
-        self.call_count = 0
-        self.avg_chunk_sum = 0
-        self.avg_chunk_len = 0
-        self.W_chunk_len = nn.Parameter(torch.randn(C, max_chunk_len) / max_chunk_len)
-        self.W_asg = nn.Parameter(torch.randn(C, 2) / C)
-        self.W_ag = nn.Parameter(torch.randn(C, C) / C)
-        self.L_ag = nn.Linear(C, C)
-        self.L_hg = nn.Linear(C, C)
-
-        self.W_z = nn.Parameter(torch.randn(C, C) / C)
-        self.U_z = nn.Parameter(torch.randn(C, C) / C)
-        self.b_z = nn.Parameter(torch.randn(C))
-
-        self.W_r = nn.Parameter(torch.randn(C, C) / C)
-        self.U_r = nn.Parameter(torch.randn(C, C) / C)
-        self.b_r = nn.Parameter(torch.randn(C))
-
-        self.W_h = nn.Parameter(torch.randn(C, C) / C)
-        self.U_h = nn.Parameter(torch.randn(C, C) / C)
-        self.b_h = nn.Parameter(torch.randn(C))
         
         self.ih = nn.Linear(C, C)
         self.hh = nn.Linear(C, C)
-        self.hj = nn.Linear(C, C)
         
         self.L_Q = nn.Linear(C, C)
         self.L_K = nn.Linear(C, C)
@@ -254,18 +213,6 @@ class COINBlock(nn.Module):
         self.h_o = nn.Linear(C, C)
 
         self.act = nn.ReLU()
-        self.fc = nn.Linear(C, C)
-        self.hn = nn.Linear(C, C)
-        
-        self.W_nQ = nn.Parameter(torch.randn(C, C) / C)
-        self.W_nK = nn.Parameter(torch.randn(C, C) / C)
-        self.W_nV = nn.Parameter(torch.randn(C, C) / C)
-
-        #self.L_n_t = nn.Linear(C, C*2)
-
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.bce_loss = nn.BCEWithLogitsLoss()
-        self.mse_loss = nn.MSELoss()
 
         self.rope = RotaryEmbedding(config.rope_dim)
         self.group_norm = nn.GroupNorm(config.group_norm_num, config.group_norm_channels,
@@ -276,7 +223,7 @@ class COINBlock(nn.Module):
         self.cope = CoPE(config.max_position_embeddings, C)
 
         self.cat_gate = nn.Parameter(torch.randn(I, I * 2) / I)
-        self.W_O = nn.Parameter(torch.randn(C, C) / C)
+        self.W_O = nn.Parameter(torch.randn(I * 2, I) / I * 2)
 
         self.WB_A_gate = nn.Linear(I, I)
         self.WB_H_gate = nn.Linear(I, I)
@@ -294,12 +241,12 @@ class COINBlock(nn.Module):
         #K = self.L_K(X)
         #V = self.L_V(X)
 
-        #Q = self.rope.rotate_queries_or_keys(Q)
-        #K = self.rope.rotate_queries_or_keys(K)
+        Q = self.rope.rotate_queries_or_keys(Q)
+        K = self.rope.rotate_queries_or_keys(K)
 
-        #Q = self.act(Q)
-        #K = self.act(K)
-        #V = self.act(V)
+        Q = self.act(Q)
+        K = self.act(K)
+        V = self.act(V)
 
         #H, S_n = self.forward_recurrent(X, S_n)
 
@@ -314,10 +261,10 @@ class COINBlock(nn.Module):
         out = A 
 
         out = self.dropout(out)
-        #out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
+        out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
         out = out.transpose(-2, -1).contiguous().view(B, T, C)
 
-        #out = self.layer_norm(out + X)
+        out = self.layer_norm(out + X)
 
         return out, S_n
 
@@ -353,13 +300,14 @@ class COINBlock(nn.Module):
         V = self.act(V)
 
         #"""
-        chunk_len = 1#T // 2
+        chunk_len = T // 2
         if chunk_len > T:
             chunk_len = T
         S_n = torch.zeros(B, chunk_len, C, device=X.device)
         
         for t in range(T):
             Q_t = Q[:, t:(t+chunk_len)]
+            print(Q_t.shape, Q.shape, S_n.shape)
             S_n = self.hh(S_n) #+ (KV[:, t, :])# / self.C)
             #S_n *= att_mask[:, t].unsqueeze(1)
             #Q_t *= att_mask[:, t].unsqueeze(1)
@@ -400,11 +348,11 @@ class COINBlock(nn.Module):
 
         #out = F.tanh(self.hh(X.cumsum(1)) + Q.cumsum(1))
 
-        #out = self.dropout(out)
-        #out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
-        #out = out.transpose(-2, -1).contiguous().view(B, T, C)
+        out = self.dropout(out)
+        out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
+        out = out.transpose(-2, -1).contiguous().view(B, T, C)
 
-        #out = self.layer_norm(out + X)
+        out = self.layer_norm(out + X)
         return out, S_n
 
     def forward_chunkwise(self, X, S_n):
@@ -789,643 +737,44 @@ class COINBlock(nn.Module):
         out = self.forward_nlayer_steps(out, depth-1)
         return out
 
-    def _dummy_S_init(self, dev):
-        return torch.zeros(1).to(dev)
-
-    def memory_skip(self, X, S_n, att_mask, input_ids, chunk_len):
-        #S_n = self._dummy_S_init(X.device)
+    def memory_skip(self, X):
         B, T, C = X.shape
         
-        #chunk_len = 1#T // 2
-        #chunk_len = X.mean(0).mean(-1).argmax(0)
-        #chunk_len = X.mean(-1).argmax(-1).float().mean()
-        #chunk_len = int(chunk_len)
-        
-        #chunk_len = input_ids.argmax(1).float().mean()
-        #chunk_len = (X @ self.W_r).sum(-1).argmax(1).float().mean()
-        #chunk_len = int(chunk_len.item())
-        
-        #print(T, chunk_len)
-        #print(X[0])
-        #print(input_ids)
-        #print(input_ids.float().mean(0).argmax(-1))
-        #chunk_len = F.softmax((X @ self.W_chunk_len).mean(0)[0], -1).argmax(-1).item()  
-        #print(X.shape, chunk_len, self.W_chunk_len.shape, (X @ self.W_chunk_len).shape, (X @ self.W_chunk_len)[0].shape)
-        #chunk_len = 2
-        #chunk_len = T // 2
-        #self.avg_chunk_sum += chunk_len
-        #self.call_count += 1
-        #if self.call_count % 500 == 0:
-        #    print("avg chunk len:", self.avg_chunk_sum / self.call_count)
-
-        #if chunk_len > T:
-        #    chunk_len = T
-        chunk_len = max(chunk_len, 1)
-        chunk_len = min(chunk_len, T)
-
-        pad_0 = torch.zeros(B, chunk_len-1, C).to(X.device)
-        #pad_X = torch.cat((X, pad_0), 1)
-        pad_X = X
-
-        #aux_loss = torch.Tensor([0]).to(X.device)
-        aux_loss = None
-        #print(aux_loss)
-        gammas = torch.linspace(0.96, 0.99, T // chunk_len + 1)#.to(X.device)
-
-        h_t = torch.zeros(B, chunk_len, C).to(X.device)
-        prev_A_state = torch.zeros(B, chunk_len, C).to(X.device)
-        #all_A_state = torch.zeros(B, chunk_len, C).to(X.device)
-        prev_scale = torch.cat((torch.linspace(0, -1, math.ceil(T/2)), torch.linspace(-1, 0, math.floor(T/2))))
-        #prev_scale = torch.linspace(1, -1, T)
-        prev_factor = prev_scale[chunk_len-1]
-        #print(prev_factor)
-        H = []
-        for i, t in enumerate(range(0, T, chunk_len)):
-            X_t = pad_X[:, t:t+chunk_len]
-            Q_t = X_t @ self.W_Q + self.b_Q
-            K_t = X_t @ self.W_K
-            V_t = X_t @ self.W_V
-
-            #Q_t = self.rope.rotate_queries_or_keys(Q_t, offset=t)
-            #K_t = self.rope.rotate_queries_or_keys(K_t, offset=t)
-
-            Q_t = self.act(Q_t)
-            K_t = self.act(K_t)
-            #V_t = self.act(V_t)
-
-            #Q_t = self.rope.rotate_queries_or_keys(Q_t)
-            #K_t = self.rope.rotate_queries_or_keys(K_t)
-
-            #g = gammas[i]
-            #D = _get_D(g, chunk_len).to(X.device)
-
-            A_t = Q_t @ K_t.transpose(-2, -1)
-            #A_t *= D.unsqueeze(0).transpose(-2, -1)
-            A_t @= V_t
-
-            #f_scores = F.softmax(A_t @ self.W_r, 1).topk(chunk_len, 1).indices
-            #print(f_scores.shape, X_t.shape, A_t.shape)
-            #A_f = X.gather(1, f_scores)
-            #print(f_scores.shape, A_f.shape, A_t.shape)
-            #A_t *= A_f
-
-            #r_t = F.sigmoid(h_t @ self.W_r + X_t @ self.U_r + self.b_r)
-
-            hat_h = self.hh(h_t)
-            h_t = F.tanh(hat_h + A_t + (prev_A_state * prev_factor))
-            #h_t = F.tanh(hat_h) + F.tanh(A_t) - F.tanh(prev_A_state) #* A_f
-            #h_t = hat_h * r_t + F.tanh(A_t - prev_A_state) * (1 - r_t)
-            #print((hat_h - prev_A_state).mean())
-            #c_loss = (h_t - prev_A_state).sum()
-            #if aux_loss is None:
-            #    aux_loss = c_loss
-            #else:
-            #    aux_loss += c_loss
-            
-            prev_A_state = A_t
-            #all_A_state = torch.cat((all_A_state, A_t), 1)
-
-            #h_t = h_t.transpose(-2, -1).reshape(h_t.shape)
-            H.append(h_t)
-
-            #self.hh.weight = self.hh.weight + nn.Parameter(h_t.mean(1).sum(0))
-            #self.hh.weight = torch.add(self.hh.weight, nn.Parameter(h_t.mean(1).sum(0)))
-            #H.append(self.fc(h_t))
-        
-        H = torch.cat(H, 1)#[:, -T:]
-        #H = torch.stack(H, 1)
-        out = H
-       
-        #out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
-        #out = out.transpose(-2, -1).contiguous().view(B, T, C)
-        #out = self.layer_norm(out + X)
-        #print(out.shape)
-        #assert X.shape == out.shape, f"{X.shape} != {out.shape}"
-
-        #print(aux_loss)
-        return out, S_n, aux_loss
-
-    def dynamic_memory_skip(self, X, S_n):
-        B, T, C = X.shape
-
-        chunk_len = 40
-        chunk_len = max(chunk_len, 1)
-        chunk_len = min(chunk_len, T)
-
-        max_chunks = T // chunk_len + 1
-
-        pad_0 = torch.zeros(B, chunk_len-1, C).to(X.device)
-        pad_X = torch.cat((X, pad_0), 1)
-
-        h_t = torch.zeros(B, chunk_len, C).to(X.device)
-        prev_A_state = torch.zeros(B, chunk_len, C).to(X.device)
-
-        H = []
-        for i in range(max_chunks):
-            # select chunk between min and max value
-            chunk_select = X @ self.W_chunk_select
-            chunk_select = F.softmax(chunk_select, -1)
-            #chunk_min = chunk_select.min(-1).indices
-            #chunk_max = chunk_select.max(-1).indices
-            chunk_select = chunk_select.topk(chunk_len, 1, largest=True)
-
-            X_t = pad_X.gather(1, chunk_select.indices) 
-
-            Q_t = X_t @ self.W_Q
-            K_t = X_t @ self.W_K
-            V_t = X_t @ self.W_V
-
-            #Q_t = self.rope.rotate_queries_or_keys(Q_t)
-            #K_t = self.rope.rotate_queries_or_keys(K_t)
-
-            Q_t = self.act(Q_t)
-            K_t = self.act(K_t)
-            #V_t = self.act(V_t)
-
-            #g = gammas[i]
-            #D = _get_D(g, chunk_len).to(X.device)
-
-            A_t = Q_t @ K_t.transpose(-2, -1)
-            #A_t *= D.unsqueeze(0).transpose(-2, -1)
-            A_t @= V_t
-
-            #f_scores = F.softmax(A_t @ self.W_r, 1).topk(chunk_len, 1).indices
-            #print(f_scores.shape, X_t.shape, A_t.shape)
-            #A_f = X.gather(1, f_scores)
-            #print(f_scores.shape, A_f.shape, A_t.shape)
-            #A_t *= A_f
-
-            hat_h = self.hh(h_t)
-            h_t = F.tanh(hat_h + A_t )#+ prev_A_state) #* A_f
-            
-            prev_A_state = A_t
-            #all_A_state = torch.cat((all_A_state, A_t), 1)
-
-            #h_t = h_t.transpose(-2, -1).reshape(h_t.shape)
-            H.append(h_t)
-
-        out = torch.cat(H, 1)[:, :T]
-
-        #out = out.transpose(-2, -1).contiguous().view(B, T, C)
-
-        out = self.layer_norm(out + X)
-
-        return out, S_n, None
-
-    def tape_memory(self, X, S_n):
-        B, T, C = X.shape
-
-        chunk_len = 10
-
-        chunk_len = max(chunk_len, 1)
-        chunk_len = min(chunk_len, T)
-
-        pad_0 = torch.zeros(B, chunk_len-1, C).to(X.device)
-        pad_X = torch.cat((X, pad_0), 1)
-        #pad_X = X
-
-        h_t = torch.zeros(B, chunk_len, C).to(X.device)
-        tape_len = T
-        tape = torch.zeros(B, tape_len, chunk_len, C).to(X.device)
-
-        H = []
-        for i, t in enumerate(range(0, T, chunk_len)):
-            X_t = pad_X[:, t:t+chunk_len]
-            Q_t = X_t @ self.W_Q
-            K_t = X_t @ self.W_K
-            V_t = X_t @ self.W_V
-            Q_t = self.act(Q_t)
-            K_t = self.act(K_t)
-            #V_t = self.act(V_t)
-            #Q_t = self.rope.rotate_queries_or_keys(Q_t)
-            #K_t = self.rope.rotate_queries_or_keys(K_t)
-            #g = gammas[i]
-            #D = _get_D(g, chunk_len).to(X.device)
-            A_t = Q_t @ K_t.transpose(-2, -1)
-            #A_t *= D.unsqueeze(0).transpose(-2, -1)
-            A_t @= V_t
-    
-            #"""
-            tape_actions = F.softmax(A_t @ self.W_tape_action, -1) # (B, T, 5)
-            tape_return = []
-            #for X_b, tape_actions in zip(X_t, all_tape_actions):
-            tape_0 = tape[:, 0].clone()
-            # (B, T) x (B, l, T, C)
-            left = tape_actions[..., 3].view(B, 1, chunk_len, 1) * tape.roll(-1, 1)
-            tape = tape + left
-            right = tape_actions[..., 4].view(B, 1, chunk_len, 1) * tape.roll(1, 1)
-            tape = tape + right
-            noop = tape_actions[..., 0].view(B, 1, chunk_len, 1) * tape
-            write = tape_actions[..., 2].unsqueeze(-1) * A_t
-            tape[:, 0] = tape_0 + write
-            read = tape_actions[..., 1].view(B, chunk_len, 1) * tape_0 # (T, C)
-            #    tape_return.append(read)
-            #X_tape = torch.stack(tape_return, 0)
-            #"""
-            hat_h = self.hh(h_t)
-            h_t = F.tanh(hat_h + read) #+ prev_A_state) #* A_f
-            prev_A_state = A_t
-            H.append(h_t)
-
-        H = torch.cat(H, 1)[:, :T]
-        #H = torch.stack(H, 1)
-        out = H
-       
-        out = self.group_norm(out.reshape(-1, self.config.group_norm_channels)).reshape(out.shape)
-        #out = out.transpose(-2, -1).contiguous().view(B, T, C)
-        out = self.layer_norm(out + X)
-        return out, S_n, None
-
-
-    def attention_split(self, X, S_n):
-        B, T, C = X.shape
-
         chunk_len = T // 2
-
+        
         if chunk_len > T:
             chunk_len = T
         chunk_len = max(chunk_len, 1)
-
         h_t = torch.zeros(B, chunk_len, C).to(X.device)
-        prev_l_t = torch.zeros(B, chunk_len, C).to(X.device)
-
-        pad_0 = torch.zeros(B, chunk_len-1, C).to(X.device)
-        pad_X = torch.cat((X, pad_0), 1)
-
-        j_size = chunk_len // 4 #+ (chunk_len % 2)
-        j_size = max(1, j_size)
-        h_j = torch.zeros(B, j_size, C).to(X.device)
+        
+        prev_A_state = torch.zeros(B, chunk_len, C).to(X.device)
 
         H = []
         for t in range(0, T, chunk_len):
-            l_t = []
-            #h_j = torch.zeros(B, j_size, C).to(X.device)
-            #prev_j_state = torch.zeros(B, j_size, C).to(X.device)
-            for j in range(0, chunk_len, j_size):
-                X_j = pad_X[:, t+j:t+j+j_size]
-                Q_j = X_j @ self.W_Q
-                K_j = X_j @ self.W_K
-                V_j = X_j @ self.W_V
-
-                A_j = Q_j @ K_j.transpose(-2, -1) @ V_j
-                #h_j = self.hj(h_j) + A_j
-                h_j = A_j #- prev_j_state
-                #prev_j_state = A_j
-                l_t.append(h_j)
-                #h_t = F.tanh(self.hh(h_t) + A_j)
-                #l_t.append(h_t)
-
-            l_t = torch.cat(l_t, 1)[:, :chunk_len]
-            h_t = F.tanh(self.hh(h_t) + l_t - prev_l_t)
-            prev_l_t = l_t
-            H.append(h_t)
-
-        out = torch.cat(H, 1)[:, :T]
-
-        assert X.shape == out.shape, f"{X.shape} != {out.shape}"
-
-        return out, S_n, None
-
-    def fold_attention(self, X, S_n):
-        B, T, C = X.shape
-
-        num_unfolds = 2
-        if num_unfolds >= T:
-            num_unfolds = max(num_unfolds, T//2)
-        mask_chunks = max(1, T // 2)
-        unfold_masks = [
-            [1] * mask_chunks + [0] * mask_chunks,
-            [0] * mask_chunks + [1] * mask_chunks
-        ]
-
-        h = torch.zeros(B, T, C).to(X.device)
-        prev_A_state = torch.zeros(B, T, C).to(X.device)
-
-        Q = X @ self.W_Q
-        K = X @ self.W_K
-        V = X @ self.W_V
-
-        for i in range(num_unfolds):
-            mask = torch.Tensor(unfold_masks[i])[:T].unsqueeze(-1).to(X.device)
-            K_i = K * mask
-            V_i = V * mask
-            Q_i = Q * mask
-            c_i = K_i.transpose(-2, -1) @ V_i
-            A_i = Q_i @ c_i
-            #A_i *= mask
-
-            hat_h = self.hh(h)
-            h = F.tanh(hat_h + A_i - prev_A_state)
-            prev_A_state = A_i
-        
-        out = h
-        
-        assert X.shape == out.shape, f"{X.shape} != {out.shape}"
-        return out, S_n, None
-
-    def dynamic_shift(self, X, S_n):
-        B, T, C = X.shape
-
-        def back_shift(y, n, h):
-            h = h.unsqueeze(1).repeat(1, n, 1) #@ self.W_h_back
-            # h * decay (eg linspace 0.96 - 0.99)
-            #h *= torch.linspace(0.96, 0.99, n).view(1, n, 1).to(y.device)
-            #return F.tanh(y + h)
-            return y + h
-
-        h_t = torch.zeros(B, C).to(X.device)
-        len_sum = 0
-
-        A = []
-        H = []
-        #next_chunk_len = F.softmax((X[0, 0] @ self.W_chunk_len), -1).argmax(-1).int().item()
-        #next_chunk_len = max(1, next_chunk_len)
-        #next_chunk_len = min(T, next_chunk_len)
-
-        #self.avg_chunk_sum += next_chunk_len
-        #self.call_count += 1
-        #if self.call_count % 500 == 0:
-        #    print("avg chunk len:", self.avg_chunk_sum / self.call_count)
-
-
-        while len_sum < T:
-            next_chunk_len = 40#T // 2
-            #next_chunk_len = ()
-            t1 = len_sum
-            t2 = len_sum + next_chunk_len
-            X_t = X[:, t1:t2]
-
+            X_t = X[:, t:t+chunk_len]
             Q_t = X_t @ self.W_Q
             K_t = X_t @ self.W_K
             V_t = X_t @ self.W_V
 
-            Q_t = self.act(Q_t)
-            K_t = self.act(K_t)
+            D = _get_D(0.99, chunk_len).to(X.device)
 
             A_t = Q_t @ K_t.transpose(-2, -1)
-            #A_t /= self.C
-            #A_t = F.softmax(A_t, -1)
+            #A_t *= D.unsqueeze(0)
             A_t @= V_t
-            #A.append(A_t)
-            hat_h = self.hh(h_t)
-            h_t = hat_h + A_t[:, -1]
-            h_t = F.tanh(h_t)
-            #local_shift = torch.cat((back_shift(A_t[:, :-1], A_t.shape[1] - 1, h_t), h_t.unsqueeze(1)), 1)
-            local_shift = back_shift(A_t, A_t.shape[1], h_t)
-            A.append(local_shift)
-            #h_t = local_shift[:, -1]
-            H.append(h_t)
 
-            len_sum += next_chunk_len
+            #print(h_t.shape, A_t.shape, prev_A_state.shape)
 
-        H = torch.stack(H, 1)
-        A = torch.cat(A, 1)
-
-        out = A
-        out = out.transpose(-2, -1).contiguous().view(B, T, C)
-        #out = self.layer_norm(out + X)
-
-        return out, S_n, None
-
-    #def argmax_chunks(self, X, S_n):
-    #    ...
-
-    def _next_n_a(self, n_t, X_t, A_t, c_t, h_t, att_mask):
-        #print(att_mask[0])
-        next_Q = X_t @ self.W_nQ
-        next_K = X_t @ self.W_nQ
-        next_V = X_t @ self.W_nQ
-        
-        next_Q = self.act(next_Q)
-        next_K = self.act(next_K)
-
-        #next_A = next_Q @ c_t
-        next_A = (next_Q @ next_K.transpose(-2, -1)) @ next_V
-        #hat_n = self.hn(n_t)
-        #next_n = (hat_n + h_t)
-        #next_n = hat_n + (h_t @ self.W_nQ)
-        hat_h = self.hh(h_t)
-        next_n = (hat_h + next_A)
-        return next_n
-
-    def next_state_prediction(self, X, S_n, att_mask, input_ids):
-        B, T, C = X.shape
-
-        chunk_len = T // 4
-        n_len = chunk_len #* 2
-
-        chunk_len = min(max(chunk_len, 1), T)
-
-        pad_0 = torch.zeros(B, chunk_len-1, C).to(X.device)
-        pad_X = torch.cat((X, pad_0), 1)
-        #pad_X = X
-
-        aux_loss = None
-        #n_t = None
-        #n_t = torch.zeros(B, chunk_len, C).to(X.device)
-        
-        prev_A_state = torch.zeros(B, chunk_len, C).to(X.device)
-
-        input_ids = torch.cat((input_ids, torch.zeros(B, n_len, dtype=input_ids.dtype, device=input_ids.device)), 1)
-        
-        if self.config.carry_over_S:
-            if S_n is not None:
-                h_t, n_t = S_n.unbind()
-            else:
-                print("INIT NEW S")
-                h_t = torch.zeros(B, chunk_len, C).to(X.device)
-                n_t = torch.ones(B, n_len, C).to(X.device) @ self.W_nQ
-        else:
-            h_t = torch.zeros(B, chunk_len, C).to(X.device)
-            n_t = torch.ones(B, n_len, C).to(X.device) @ self.W_nQ
-
-        R_t = torch.zeros(B, n_len, C).to(X.device)
-        #print("NEW STATE")
-        H = []
-        for i, t in enumerate(range(0, T, chunk_len)):
-            #new_n_t = F.tanh(self.hn(n_t) + R_t)
-            X_t = pad_X[:, t:t+chunk_len] #+ n_t
-            #X_t = torch.cat((pad_X[:, t:t+chunk_len], n_t), 1)
-            Q_t = X_t @ self.W_Q
-            K_t = X_t @ self.W_K
-            V_t = X_t @ self.W_V
-
-            #Q_t = self.rope.rotate_queries_or_keys(Q_t, offset=t)
-            #K_t = self.rope.rotate_queries_or_keys(K_t, offset=t)
-
-            Q_t = self.act(Q_t)
-            K_t = self.act(K_t)
-            V_t = self.act(V_t)
-
-            #Q_t = self.rope.rotate_queries_or_keys(Q_t)
-            #K_t = self.rope.rotate_queries_or_keys(K_t)
-
-            #g = gammas[i]
-            g = 0.99
-            D = _get_D(g, chunk_len).to(X.device)
-
-            c_t = Q_t @ K_t.transpose(-2, -1)
-            #c_t *= D.unsqueeze(0)#.transpose(-2, -1)
-            A_t = c_t @ V_t
-            #c_t = K_t.transpose(-2, -1) @ V_t
-            #A_t = Q_t @ c_t
-            #A_t = self.L_n_t(A_t.transpose(-2, -1)).transpose(-2, -1)
-            #R_t = A_t[:, -n_len:]
-            #A_t = A_t[:, :chunk_len]
-
-            #new_n_t = F.tanh(self.hn(n_t) + R_t)
-
-            hat_h = self.hh(h_t)
-            h_t = F.tanh(hat_h + A_t )#- prev_A_state)
-
-            #t_loss = (X_t[:, :chunk_len] - n_t).abs().mean()
-            #n_t *= att_mask[:, t:t+chunk_len].unsqueeze(-1)#.repeat(1, 1, C)
-            #xn_t = X_t * att_mask[:, t:t+chunk_len].unsqueeze(-1)
-            #t_loss = self.mse_loss(n_t, X_t[:, :chunk_len])
-            #print(n_t.shape, input_ids.shape)
-            #t_loss = self.ce_loss(self.vocab_fc(n_t).reshape(-1, self.config.vocab_size), input_ids[:, t:t+n_len].reshape(-1))
-            #print(t_loss.shape)
-            #t_loss *= att_mask[:, t:t+chunk_len].unsqueeze(-1)#.repeat(1, 1, C)
-            #t_loss = t_loss.mean()
+            h_t = F.tanh(self.hh(h_t) + A_t - prev_A_state)
+            prev_A_state = A_t
             
-            """
-            if aux_loss is None:
-                aux_loss = t_loss
-            else:
-                aux_loss += t_loss
-            """
-
-            #h_t = self._next_n_a(n_t, X_t, A_t, c_t, h_t, att_mask)
-            #n_t = (X_t @ self.W_nQ) + h_t @ self.W_nK
-            #n_t = F.tanh(self.hh(h_t) + (X_t @ self.W_nQ))
-            #n_t = F.tanh(self.hh(h_t) + self.ih(n_t + A_t))
-            #n_t = F.tanh(self.hn(n_t) + R_t)
-            #n_t = new_n_t
-
-            #h_t = F.softmax(torch.stack((h_t, n_t), -1), -1).sum(-1)
-
-            #r_t = F.sigmoid(X_t @ self.W_r + self.b_r)
-            #h_t = (h_t )#* r_t) #+ (n_t * (1 - r_t))
-
-            prev_A_state = A_t
             H.append(h_t)
-        
-        H = torch.cat(H, 1)[:, -T:]
 
-        #aux_loss = None
-        #print(aux_loss.item())
+        H = torch.cat(H, 1)
 
-        out = H
-        #out = out.transpose(-2, -1).reshape(B, T, C)
-        #out = self.layer_norm(out + X)
+        return H
 
-        S_n = h_t# torch.stack([h_t, n_t])
-        return out, S_n, aux_loss
-
-    def pseudo_next_state_pass(self, X, S_n, att_mask):
-        B, T, C = X.shape
-
-        chunk_len = T // 4
-
-        chunk_len = min(max(chunk_len, 1), T)
-
-        pad_0 = torch.zeros(B, chunk_len, C).to(X.device)
-        pad_X = torch.cat((X, pad_0), 1)
-        #pad_X = X
-
-        prev_A_state = torch.zeros(B, chunk_len, C).to(X.device)
-        
-        if self.config.carry_over_S:
-            if S_n is not None:
-                h_t, n_t = S_n.unbind()
-            else:
-                print("INIT NEW S")
-                next_h_t = torch.zeros(B, chunk_len, C).to(X.device)
-                n_t = torch.ones(B, chunk_len, C).to(X.device) @ self.W_nQ
-        else:
-            next_h_t = torch.zeros(B, chunk_len, C).to(X.device)
-            n_t = torch.ones(B, chunk_len, C).to(X.device) @ self.W_nQ
-
-
-        def att(x):
-            q = x @ self.W_Q
-            k = x @ self.W_K
-            v = x @ self.W_V
-            q = self.act(q)
-            k = self.act(k)
-            v = self.act(v)
-            a = q @ k.transpose(-2, -1)
-            return a @ v
-
-        def time_step(x, h):
-            y = self.hh(h) + self.ih(x)
-            return y
-            #return F.sigmoid(y)
-            #return torch.log(y)
-            return F.tanh(y)
-
-        h_t = torch.zeros(B, chunk_len, C).to(X.device)
-        aux_loss = None
-
-        X_0 = pad_X[:, 0:chunk_len]
-        A_0 = att(X_0) #+ X_0
-        h_t = time_step(A_0, h_t)
-
-        H = []
-        for i, t in enumerate(range(0, T, chunk_len)):
-            t += chunk_len
-            X_t = pad_X[:, t:t+chunk_len]
-            A_t = att(X_t) #+ (h_t)
-
-            #X_tp1 = pad_X[:, t+chunk_len : t+(chunk_len*2)]
-            #A_tp1 = att(X_tp1) 
-
-            #h_t = time_step(X_t, h_t) + time_step(X_tp1, h_t)
-            #h_t = time_step(X_t, h_t) 
-            #h_t = h_t + time_step(X_tp1, h_t)
-            #print(A_tp1.shape, h_t.shape)
-            h_tp1 = time_step(A_t, h_t) #@ self.E
-
-            n_t = h_t + h_tp1 #+ (X_t @ self.A)
-            H.append(n_t)
-
-            h_t = time_step(A_t, h_t)
-            #h_t = h_tp1
-
-            #r_t = F.sigmoid(h_t @ self.W_r + h_tp1 @ self.U_r + self.b_r)
-
-            #n_t = h_t + h_tp1
-            #n_t = (r_t * h_t) + ((1 - r_t) * h_tp1)
-
-            #f_loss = (h_t - ( h_tp1)).abs().mean()
-            #f_loss = self.mse_loss(h_tp1, h_t)
-            f_loss = None
-
-            if aux_loss is None:
-                aux_loss = f_loss
-            else:
-                aux_loss += f_loss
-
-            #H.append(n_t)
-
-            prev_A_state = A_t
-            #H.append(h_t)
-
-        H = torch.cat(H, 1)#[:, -T:]
-
-        #aux_loss = None
-        #print(aux_loss.item())
-
-        out = H
-        #out = A_0
-        out = self.dropout(out)
-        #out = out.transpose(-2, -1).reshape(B, T, C)
-        out = self.layer_norm(out + X)
-
-        S_n = torch.stack([next_h_t, n_t])
-        return out, S_n, aux_loss
-
-    def forward(self, X, d_X, att_mask, S_n, input_ids, chunk_len):
+   
+    def forward(self, X, d_X, att_mask, S_n):
         #return self.forward_recurrent(X, att_mask, S_n)
         #return self.forward_parallel(X, att_mask, S_n)
         #return self.forward_chunkwise(X, S_n)
@@ -1434,50 +783,28 @@ class COINBlock(nn.Module):
         #return self.forward_chn_prl(X, d_X, S_n)
         #return self.forward_nlayer_steps(X, 2), S_n
         #return self.autochunk(X), S_n
-        
-        return self.memory_skip(X, S_n, att_mask, input_ids, chunk_len)
-        #return self.dynamic_memory_skip(X, S_n)
-        #return self.tape_memory(X, S_n)
-
-        #return self.attention_split(X, S_n)
-        #return self.fold_attention(X, S_n)
-        #return self.dynamic_shift(X, S_n)
-
-        #return self.next_state_prediction(X, S_n, att_mask, input_ids)
-        #return self.pseudo_next_state_pass(X, S_n, att_mask)
+        return self.memory_skip(X), S_n
 
 
 class COIN(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.chunk_schema = config.chunk_schema
         self.layers = nn.ModuleList([
-            COINBlock(config) for _ in self.chunk_schema
+            COINBlock(config) for _ in range(config.num_hidden_layers)
         ])
 
-    def forward(self, X, d_X, att_mask, S, input_ids):
+    def forward(self, X, d_X, att_mask, S=None):
         B, T, C = X.shape
         if S is None:
-            S = [None for _ in range(self.config.num_hidden_layers)]
-        #    S = torch.zeros(self.config.num_hidden_layers, B, C, device=X.device)
+            S = torch.zeros(self.config.num_hidden_layers, B, C, device=X.device)
         new_S = []
-        #loss = torch.Tensor([0]).to(X.device)
-        loss = None
-        for L, S_n, chl in zip(self.layers, S, self.chunk_schema):
-            X, ts, aux_loss = L(X, d_X, att_mask, S_n, input_ids, chl(T))
+        for L, S_n in zip(self.layers, S):
+            X, ts = L(X, d_X, att_mask, S_n)
             new_S.append(ts)
-            if aux_loss is not None:
-                #loss += aux_loss
-                if loss is None:
-                    loss = aux_loss
-                else:
-                    loss += aux_loss
-        if all([n is not None for n in new_S]):
-        #if new_S is not None:
-            S = torch.stack(new_S)
+        S = torch.stack(new_S)
         #print(X.shape)
-        return X, S, loss
+        return X, S
 
 
 class COINForParityCheck(nn.Module):
@@ -1490,74 +817,21 @@ class COINForParityCheck(nn.Module):
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, input_ids, decoder_input_ids=None, S=None, labels=None, attention_mask=None, **kwargs):
+    def forward(self, input_ids, decoder_input_ids, S, labels, attention_mask=None, **kwargs):
         #if not self.training:
         #    decoder_input_ids = input_ids.clone()
-        
+
         X = F.one_hot(input_ids.long(), self.config.vocab_size).float()
         X = self.embeddings(X)
-        if decoder_input_ids is not None:
-            d_X = F.one_hot(decoder_input_ids.long(), self.config.vocab_size).float()
-            d_X = self.decoder_embeddings(d_X)
-        else:
-            d_X = None
-        Y, S, aux_loss = self.coin(X, d_X, attention_mask, S, input_ids)
+        d_X = F.one_hot(decoder_input_ids.long(), self.config.vocab_size).float()
+        d_X = self.decoder_embeddings(d_X)
+        Y, S = self.coin(X, d_X, attention_mask, S)
         #Y = Y.flip(-1)
         Y = self.classifier(Y[:, -1])
 
         labels = labels.long()
         #Y = Y.flip(-1)
         loss = self.loss_fn(Y, labels)
-        if aux_loss is not None:
-            loss += aux_loss#.mean()
-        return Output(
-            logits=Y,
-            S=S,
-            loss=loss
-        )
-
-
-class COINForBucketSort(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.embeddings = nn.Linear(config.vocab_size, config.hidden_size)
-        self.decoder_embeddings = nn.Linear(config.vocab_size, config.hidden_size)
-        self.coin = COIN(config)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.loss_fn = nn.CrossEntropyLoss()
-        #self.W_out = nn.Parameter(torch.randn())
-
-    def forward(self, input_ids, decoder_input_ids=None, S=None, labels=None, attention_mask=None, **kwargs):
-        
-        X = F.one_hot(input_ids.long(), self.config.vocab_size).float()
-        X = self.embeddings(X)
-        B, T, C = X.shape
-        if decoder_input_ids is not None:
-            d_X = F.one_hot(decoder_input_ids.long(), self.config.vocab_size).float()
-            d_X = self.decoder_embeddings(d_X)
-        else:
-            d_X = None
-
-        Y, S, aux_loss = self.coin(X, d_X, attention_mask, S, input_ids)
-
-        #Y = Y[:, -math.ceil(T/2):]
-
-        Y = self.lm_head(Y)
-
-        #Y = Y[:, :math.ceil(T/2)]
-        #Y = (Y.transpose(-2, -1) @ self.W_out).transpose(-2, -1)
-
-        labels = labels.long()
-        #print(input_ids.shape, X.shape, Y.shape, labels.shape)
-        #print(input_ids, "\n", labels)
-        loss = self.loss_fn(Y.reshape(-1, Y.shape[-1]), labels.view(-1))
-        if aux_loss is not None:
-            #print(loss.shape, aux_loss.shape)
-            #print(loss, aux_loss)
-            loss += aux_loss.item()
-        #loss = self.loss_fn(Y, labels)
         return Output(
             logits=Y,
             S=S,
@@ -1589,22 +863,17 @@ class COINForSequenceClassification(nn.Module):
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         self.loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, input_ids, decoder_input_ids, S, attention_mask, labels, **kwargs):
+    def forward(self, input_ids, decoder_input_ids, attention_mask, labels, **kwargs):
         X = self.word_embeddings(input_ids)
         d_X = self.decoder_embeddings(decoder_input_ids) if decoder_input_ids is not None else None
-        Y, S, aux_loss = self.coin(X, d_X, attention_mask, S, input_ids)
+        Y, S = self.coin(X, d_X, attention_mask)
         #Y = Y.flip(-1)
         Y = self.dropout(Y)
-        Y = self.pooler(Y[..., -1, :])
+        Y = self.pooler(Y[..., 0, :])
         Y = self.classifier(Y)
-        #labels = (labels).long()#.flip(-1)
+        #labels = (labels == 0).long()#.flip(-1)
         #Y = (Y.argmax(-1) == 0).int()
-        if 1:#self.training:
-            loss = self.loss_fn(Y, labels)
-            if aux_loss is not None:
-                loss += aux_loss
-        else:
-            loss = torch.autograd.Variable(aux_loss, requires_grad=True)
+        loss = self.loss_fn(Y, labels)
         return Output(
             logits=Y,
             S=S,
@@ -1722,20 +991,13 @@ class MyRNN(nn.Module):
         ])
 
     def forward(self, X, h_0=None):
-        #B, T, C = X.shape
-        T = X.shape[-2]
-        C = X.shape[-1]
+        B, T, C = X.shape
         if h_0 is None:
-            if X.dim() == 2:
-                h_shape = (C,)
-            else:
-                B = X.shape[0]
-                h_shape = (B, C)
-            h_0 = torch.zeros(self.config.num_hidden_layers, *h_shape).to(X.device)
+            h_0 = torch.zeros(self.config.num_hidden_layers, B, C).to(X.device)
         h_t = h_0
         ret = []
         for t in range(T):
-            cy = X[..., t, :]
+            cy = X[:, t, :]
             n_h_t = []
             for l in range(self.config.num_hidden_layers):
                 cy = self.cells[l](cy, h_t[l])
@@ -1752,34 +1014,23 @@ class RNNForParityCheck(nn.Module):
         super().__init__()
         self.config = config
         self.embeddings = nn.Linear(config.vocab_size, config.hidden_size)
-        #self.embeddings = nn.Linear(5, config.hidden_size)
         #self.rnn = RNN(config)
         #self.rnn = nn.RNN(config.hidden_size, config.hidden_size, config.num_hidden_layers, batch_first=True)
         #self.rnn = SimpleRNN(config.hidden_size, config.hidden_size, config.num_hidden_layers, True, config.hidden_size)
         self.rnn = MyRNN(config)
-        self.classifier = nn.Sequential(
-            nn.ReLU(),
-            #nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Linear(config.hidden_size, config.num_labels)
-        )
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         self.loss_fn = nn.CrossEntropyLoss()
     
     def forward(self, input_ids, labels, **kwargs):
         X = F.one_hot(input_ids.long(), self.config.vocab_size).float()
-        #print(X.shape, self.embeddings.shape)
         X = self.embeddings(X)
-        B, T, C = X.shape
-        #X = X.reshape(B*T, C)
         Y, S = self.rnn(X)
         #print(Y.shape)
-        #Y = Y.reshape(B, T, C)
         Y = self.classifier(Y[:, -1])
-        #Y = Y[:, -1]
         #Y = self.classifier(Y)
         #print(Y)
         #print(labels)
         loss = self.loss_fn(Y, labels.long())
-        #loss = self.loss_fn(Y, F.one_hot(labels, 5).float())
         return Output(
             logits=Y,
             S=S,

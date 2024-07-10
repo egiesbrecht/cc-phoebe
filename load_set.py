@@ -5,6 +5,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import itertools
+import random
+import functools
+import math
+import tree
+import tqdm
+import collections
+from typing import List, Union
+from model_training import segment_prod, segment_sum
 
 
 def load_set(paths, use_one_label_only=False, iloc_limit: int=None, as_dataset=True, drop_unused=True, drop_labels=False, unused_fields=None):
@@ -61,9 +69,11 @@ def generate_ch_batches(generate_set_fn, B, T_train, T_test, vocab_size, num_tra
         ))
     elif sample_method == "static":
         U = [T_train] * num_train_samples
+        #U = torch.full((num_train_samples,), T_train)
     else:
         raise ValueError(sample_method)
-    #U += U % 2
+    #print(U)
+    #U += U % 2 #+ U % 4
     print("sample schema:", U)
     train_buf = [generate_set_fn(B, n, vocab_size) for n in U]
     test_buf = [generate_set_fn(B, T_test, vocab_size) for _ in range(num_test_samples)]
@@ -111,7 +121,7 @@ def generate_parity_check_set(B: int, T: int, vocab_size):
     }
 
 
-def generate_missing_duplicate_string_set(B: int, T: int, vocab_size):
+def generate_missing_duplicate_string_set(B: int, T: int, vocab_size: None):
     if T == 1:
         dupl_string = torch.ones(B, T)
         dii = dupl_string.clone()
@@ -138,26 +148,291 @@ def generate_missing_duplicate_string_set(B: int, T: int, vocab_size):
     }
 
 
-def generate_static_parity_check_set(B, T_train, T_test, num_train_samples, num_test_samples):
-    train_ii = []
-    ls = torch.linspace(1, T_train, num_train_samples, dtype=int)
-    #for i in range(1, num_samples+1):
-    for i in ls:
-        train_ii.append(torch.randint(0, 2, (B, i)))
-    test_ii = [torch.randint(0, 2, (B, T_test)) for _ in range(num_test_samples)]
-    train_labels = [x.sum(1) % 2 for x in train_ii]
-    test_labels = [x.sum(1) % 2 for x in test_ii]
-    train_o = [
-        {
-            "input_ids": ii,
-            "labels": ll
-        } for ii, ll in zip(train_ii, train_labels)
-    ]
-    test_o = [
-        {
-            "input_ids": ii,
-            "labels": ll
-        } for ii, ll in zip(test_ii, test_labels)
-    ]
-    return train_o, test_o
+def expression_from_numbers(numbers_n, numbers_m):
+    """placeholder insertion"""
+    return [n + [2] + m for n, m in zip(numbers_n, numbers_m)]
+    #return [n + m for n, m in zip(numbers_n, numbers_m)]
 
+
+def numbers_to_variable_length_binary(numbers: List[int], Ts: List[int], litte_endian=True):
+    bin_strs = [f"{num:b}".zfill(t) for num, t in zip(numbers, Ts)]
+    if litte_endian:
+        bin_strs = [bin[::-1] for bin in bin_strs]
+    return [list(map(int, bin)) for bin in bin_strs]
+
+
+def numbers_to_fixed_length_binary(numbers: List[int], T: int, litte_endian=True):
+    return numbers_to_variable_length_binary(numbers, [T] * len(numbers), litte_endian)
+
+
+def _sample_expressions_and_results(B: int, T: int):
+    if T <= 2:
+        numbers = torch.randint(0, 2**T - 1, (B,))
+        expressions = numbers_to_fixed_length_binary(numbers, T)
+        results = numbers_to_fixed_length_binary(numbers, 0)
+        return expressions, results
+    
+    length_n = torch.randint(1, T-1, (B,))
+    length_m = T - 1 - length_n
+    #length_n = length_m = torch.full((B, ), T // 2)
+    #t4 = T // 4
+    #tr = T - 1 - t4
+    #length_m = torch.full((B,), t4)
+    #length_n = torch.full((B,), tr)
+
+    int_n = [random.randint(1, 2**int(len_n) - 1) for len_n in length_n]
+    int_m = [random.randint(1, 2**int(len_m) - 1) for len_m in length_m]
+    bin_n = numbers_to_variable_length_binary(int_n, length_n)
+    bin_m = numbers_to_variable_length_binary(int_m, length_m)
+    expressions = expression_from_numbers(bin_n, bin_m)
+    int_sum = list(map(sum, zip(int_n, int_m)))
+    results = numbers_to_fixed_length_binary(int_sum, 0)
+    return expressions, results
+
+
+def generate_binary_addition_set(B: int, T: int, vocab_size: None):
+    # litte endian
+    expressions, results = _sample_expressions_and_results(B, T+1)
+    # padding
+    #results = [res + [0] * (T - len(res)) for res in results]
+    results = [res + [2] + [0] * (T - len(res)) for res in results]
+    #results = [[0] * (T - len(res) + 1) + res for res in results]
+    expressions = torch.Tensor(expressions)#, dtype=torch.int32)
+    results = torch.Tensor(results)#, dtype=torch.int32)
+    return {
+        "input_ids": expressions,
+        "labels": results
+    }
+
+
+def binary_addition_mask(target):
+    B, T = target.shape[:2]
+    term_idcs = np.argmax(
+        np.argmax(target, axis=-1), axis=-1, keepdims=True
+    )
+    idcs = np.tile(np.arange(T), (B, 1))
+    mask = idcs <= term_idcs
+    return mask
+    
+
+def generate_binary_sqrt_set(B: int, T: int, vocab_size: None):
+    # big endian
+    numbers = [random.randint(1, 2**T - 1) for _ in range(B)]
+    binary_numbers = numbers_to_fixed_length_binary(numbers, T, litte_endian=False)
+    sqrts = list(map(math.isqrt, numbers))
+    out_len = math.ceil(T / 2)
+    binary_sqrts = torch.Tensor(numbers_to_fixed_length_binary(sqrts, out_len, litte_endian=False))
+    binary_sqrts = torch.cat((torch.zeros(B, math.floor(T / 2)), binary_sqrts), 1)
+    return {
+        "input_ids": torch.Tensor(binary_numbers),
+        "labels": (binary_sqrts)
+    }
+
+
+def binary_sqrt_mask(target):
+    B, T = target.shape[:2]
+    mask = np.concatenate((
+        np.full((B, math.floor(T / 2)), 0),
+        np.full((B, math.ceil(T / 2)), 1)
+    ), axis=1)
+    return mask
+
+
+def _replace_subtractions(expression, modulus):
+    assert expression.dim() == 1, expression.shape
+    if expression.shape[0] < 2:
+        return expression
+    mask = (expression == modulus + OP_BY_CHARACTER['-'])
+    subtract_replaced = torch.where(mask, modulus + OP_BY_CHARACTER['+'], expression)
+    return subtract_replaced[2:] * (1 - 2 * mask[1:-1])
+
+
+def _perform_multiplications(expression, modulus):
+    term_ids = torch.cumsum(expression == modulus + OP_BY_CHARACTER['+'], -1)[::2].long()
+    maximum_term_number = expression.shape[0] // 2 + 1
+    #print(expression.shape, expression[::2].shape, term_ids.shape)
+    products = segment_prod(expression[::2], term_ids, maximum_term_number)
+    valid_segment_mask = torch.arange(maximum_term_number) <= term_ids[-1]
+    return products * valid_segment_mask
+
+
+def _replace_blanks(expression, modulus):
+    mask = (expression == OP_BY_CHARACTER['_'] + modulus)
+    operator_mask = mask
+    operator_mask[::2] = False
+    residual_mask = mask
+    residual_mask[1::2] = False
+
+    blanks_replaced = torch.where(operator_mask, OP_BY_CHARACTER['+'] + modulus, expression)
+    blanks_replaced = torch.where(residual_mask, 0, blanks_replaced)
+    return blanks_replaced
+
+
+def _evaluate_expression(expression, modulus):
+    expression = _replace_blanks(expression, modulus)
+    expression = _replace_subtractions(expression, modulus)
+    additive_term = _perform_multiplications(expression, modulus)
+    return torch.sum(additive_term, 0) % modulus
+
+
+OP_BY_CHARACTER = {
+    '+': 0,
+    '-': 1,
+    '*': 2,
+    '_': 3
+}
+
+
+def generate_modular_arithmetic_set(B: int, T: int, vocab_size: int):
+    modulus = 5
+    operators_chars = ('+', '*', '-')
+    operators = [OP_BY_CHARACTER[op] for op in operators_chars]
+
+    assert vocab_size == (modulus + len(OP_BY_CHARACTER)), f"vocab size {vocab_size} has to be {modulus + len(OP_BY_CHARACTER)}"
+
+    if T % 2 != 1:
+        T -= 1
+    batch = torch.empty((B, T), dtype=torch.int)
+    remainders = torch.randint(0, modulus, (B, T // 2 + 1))
+    
+    ops = modulus + torch.Tensor(operators)
+    operations = ops[torch.randint(len(ops), (B, T // 2))]
+    batch[:, ::2] = remainders
+    expressions = batch
+    expressions[:, 1::2] = operations
+
+    evaluate = functools.partial(_evaluate_expression, modulus=modulus)
+    labels = torch.vmap(evaluate)(expressions)
+    return {
+        "input_ids": expressions,
+        "labels": labels
+    }
+
+
+def _generate_one_expression_and_result(modulus, T, mult=False):
+    def gen_terminal():
+        #terminal = torch.randint(0, modulus)
+        terminal = random.randint(0, modulus-1)
+        return str(terminal), terminal
+    
+    if T < 1:
+        raise ValueError(f"Can't generate expressions of length < 1, got {T}")
+    if T == 1:
+        return gen_terminal()
+    elif T == 2:
+        term_str, term_val = gen_terminal()
+        return f"-{term_str}", -term_val % modulus
+    elif T == 3:
+        term_str, term_val = gen_terminal()
+        return f"({term_str})", term_val % modulus
+    elif T == 4:
+        term_str, term_val = gen_terminal()
+        return f"(-{term_str})", -term_val % modulus
+    
+    #left_len = torch.randint(1, T-3)
+    left_len = random.randint(1, T-4)
+    right_len = T - (left_len + 3)
+    left_str, left_val = _generate_one_expression_and_result(modulus, left_len, mult)
+    right_str, right_val = _generate_one_expression_and_result(modulus, right_len, mult)
+
+    maxop = 3 if mult else 2
+    #op = torch.randint(0, maxop)
+    op = random.randint(0, maxop)
+    if op == 0:
+        return "(" + left_str + "+" + right_str + ")", (left_val + right_val) % modulus
+    elif op == 1:
+        return "(" + left_str + "-" + right_str + ")", (left_val - right_val) % modulus
+    else:
+        return "(" + left_str + "*" + right_str + ")", (left_val - right_val) % modulus
+
+
+def _generate_raw_modari_dataset(n, lengths, modulus, mutl=False, with_tqdm=False):
+    alphabet_to_int = {
+        '+': modulus,
+        '-': modulus + 1,
+        '*': modulus + 2,
+        '(': modulus + 3,
+        ')': modulus + 4,
+        'x': modulus + 5,
+        '=': modulus + 6,
+    }
+    for x in range(modulus):
+        alphabet_to_int[str(x)] = x
+    
+    def make_default_dict():
+        return {
+            "expressions": [],
+            "results": []
+        }
+        
+    sequences = collections.defaultdict(make_default_dict)
+    range_lengths = tqdm.tqdm(lengths) if with_tqdm else lengths
+    for length in range_lengths:
+        for _ in range(n // len(lengths)):
+            seq, labels = _generate_one_expression_and_result(modulus, length, mutl)
+            seq = [alphabet_to_int[x] for x in seq]
+            sequences[length]["expressions"].append(seq)
+            sequences[length]["results"].append(labels)
+    #sequences = tree.traverse(
+    #    lambda l: torch.Tensor(l),
+    #    sequences,
+    #    top_down=False
+    #)
+    return dict(sequences)
+
+
+def generate_modular_arithmetic_brackets_set(B: int, T: int, vocab_size: int):
+    modulus = 5
+    mult = True
+    with_tqdm=False
+
+    assert vocab_size == modulus + 6, f"vocab size {vocab_size} has to be {modulus + 6}"
+
+    batch = _generate_raw_modari_dataset(B, [T], modulus, mult, with_tqdm)[T]
+    return {
+        "input_ids": torch.Tensor(batch["expressions"]),
+        "labels": torch.Tensor(batch["results"])
+    }
+
+
+def generate_str_modular_arithmetic_set(B: int, T: int, vocab_size: int):
+    modulus = 5
+    operator_chars = ('+', '-', '*')
+    sign_encoding = {
+        '0': 0,
+        '1': 1,
+        '2': 2,
+        '3': 3,
+        '4': 4,
+        '+': 5,
+        '-': 6,
+        '*': 7,
+    }
+    
+    if T % 2 == 1:
+        T -= 1
+
+    def rand_num():
+        return str(random.randint(0, 4))
+    
+    def rand_sign():
+        return random.choice(operator_chars)
+
+    equations = []
+    labels = []
+    for _ in range(B):
+        eq = []
+        for i in range(0, T-1, 2):
+            eq.append(rand_num())
+            eq.append(rand_sign())
+        eq.append(rand_num())
+        l = int(eval("".join(eq))) % modulus
+        encode = [sign_encoding[k] for k in eq]
+        equations.append(encode)
+        labels.append(l)
+    equations = torch.Tensor(equations)
+    labels = torch.Tensor(labels)
+    return {
+        "input_ids": equations,
+        "labels": labels
+    }    

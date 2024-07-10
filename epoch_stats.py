@@ -22,9 +22,10 @@ def hamming_score(y_true, y_pred, normalize=True, sample_weight=None):
 
 
 class EpochStats(JSONEncoder):
-    def __init__(self, name, id2label, chomsky_task=False):
+    def __init__(self, name, id2label, chomsky_task=False, accuracy_mask=None):
         self.name = name
         self.chomsky_task = chomsky_task
+        self.accuracy_mask = accuracy_mask
         self.id2label = id2label
         self.scores = {}
         self.scores_by_label = {}
@@ -98,17 +99,23 @@ class EpochStats(JSONEncoder):
                 prec = precision_score(yt_n, yp_n, average=None, zero_division=zd_val)
                 self.add_label_score("precision", lp, rec)
         #print(y_pred.shape, y_pred)
-        #print(labels.shape, labels)
+        #print(labels.shape, labels.shape)
+        #print(y_pred, labels)
         
         #y_pred = (y_pred == 0)#.int()
 
         if self.chomsky_task:
-            self.add_score("accuracy", (y_pred == labels).mean())
+            if self.accuracy_mask is not None:
+                mask = self.accuracy_mask(labels)
+                acc = np.sum(mask * (y_pred == labels)) / np.sum(mask)
+            else:
+                acc = (y_pred == labels).mean()
+            self.add_score("accuracy", acc)
         else:
             self.add_score("accuracy", accuracy_score(labels, y_pred))
             if len(labels) > 2:
                 self.add_score("hamming", hamming_score(labels, y_pred))
-            self.add_score("per class f1", pc_f1(y_pred, labels, False, False))
+            #self.add_score("per class f1", pc_f1(y_pred, labels, False, False))
             self.add_score("f1_micro", f1_score(labels, y_pred, average="micro", zero_division=zd_val))
             self.add_score("f1_macro", f1_score(labels, y_pred, average="macro", zero_division=zd_val))
             self.add_score("recall_micro", recall_score(labels, y_pred, average="micro", zero_division=zd_val))

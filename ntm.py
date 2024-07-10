@@ -47,7 +47,7 @@ class NTM(nn.Module):
         
         # Create controller
         self.ctrl_dim = ctrl_dim
-        self.controller = Controller(input_dim + num_heads * memory_unit_size,
+        self.controller = Controller(input_dim ,#+ num_heads * memory_unit_size,
                                      ctrl_dim, 
                                      output_dim, 
                                      ctrl_dim + num_heads * memory_unit_size)
