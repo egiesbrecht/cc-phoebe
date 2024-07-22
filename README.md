@@ -10,4 +10,4 @@ Unterstützt masked LM, causal LM und Übersetzung.
 Logs vom Pretraining, ohne die großen Gewichte.
 
 # [Benchmark](all_label_benchmark.md)
-
+[Testing notebook](abstract_classification.ipynb)
