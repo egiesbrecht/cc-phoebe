@@ -20,6 +20,10 @@ base 8 layer decoder config, no pretraining <br>
 .79 / .66 epoch 6 <br>
 [full log](hyp_cls/RoBERTa-base_all-labels/)
 
+## BiomedBERT
+.85 / .68 epoch 7 <br>
+[full log](hyp_cls/BiomedBERT-base_all-labels/)
+
 ## BERT base
 .80 / .67 epoch 8 <br>
 [full log](hyp_cls/BERT-base_all-labels/)
