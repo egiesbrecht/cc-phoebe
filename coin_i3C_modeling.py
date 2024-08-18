@@ -391,28 +391,6 @@ class SingleHeadQKV(nn.Module):
         out = self._out(X_Q, out)
         return out, R_i
 
-    def parallel_action(self, X_Q, X_KV, att_mask, offset, n_turn=0):
-        if n_turn >= self.max_turns :#or X_Q.mean() < self.turn_threshold:
-            return self.forward_parallel(X_Q, X_KV, att_mask, offset)
-
-        actions = X_Q @ self.W_ac #+ self.ac_bias
-        actions = F.softmax(actions, -1)
-        
-        repeat = actions[..., 0]
-        return_state = actions[..., 1]
-        noop = actions[..., 2]
-
-        repeat_Q = X_Q * repeat.unsqueeze(-1)
-        #repeat_KV = X_KV * repeat.unsqueeze(-1)
-        return_Q = X_Q * return_state.unsqueeze(-1)
-        #return_KV = X_KV * return_state.unsqueeze(-1)
-        noop_Q = X_Q * noop.unsqueeze(-1)
-
-        out = self.forward_parallel(return_Q, X_KV, att_mask, offset)
-        out += self.parallel_action(repeat_Q, X_KV, att_mask, offset, n_turn+1)
-        out += noop_Q
-        return out
-
     def forward(self, X_Q, X_KV=None, S_n=None, att_mask=None, offset=0):
         if self.config.forward_method == "parallel":
             y = self.forward_parallel(X_Q, X_KV, att_mask, offset)
@@ -1052,6 +1030,11 @@ class COINLayer(nn.Module):
         print(f"layer {i} num experts: {self.num_experts}")
 
     def forward(self, encoder_query, decoder_query, encoder_hidden_state, residual_query, S_n, att_mask, offset):
+        B, T, C = encoder_query.shape
+        if decoder_query is None:
+            decoder_query = torch.zeros(self.num_experts, B, T, C)
+        if residual_query is None:
+            residual_query = torch.zeros(self.num_experts, B, T, C)
         eq_out, dq_out, ehs_out, rq_out, s_out = [], [], [], [], []
         for B, s_b in zip(self.blocks, S_n):
             eq, dq, ehs, rq, s_i = B(encoder_query, decoder_query, encoder_hidden_state, residual_query, s_b, att_mask, offset)
@@ -1164,6 +1147,60 @@ class COINModel(COINPreTrainedModel):
         return out, pooled_out, S, encoder_hidden_state
 
 
+class COINForFeedbackModelingClassification(COINPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.model_encoder_embeddings = COINEmbeddings(config)
+        self.feedback_encoder_embeddings = COINEmbeddings(config)
+        self.model_encoder = COINStack(config)
+        self.feedback_encoder = COINStack(config)
+        self.feedback_cls = COINLMPredictionHead(config)
+        self.pool_cls = nn.Sequential(
+            COINPooler(config),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.hidden_size, config.num_labels)
+        )
+        self.loss_fn = nn.CrossEntropyLoss()#reduction="none")
+        self.mse_fn = nn.MSELoss()
+        self.post_init()
+
+    def forward(self, input_ids, decoder_input_ids, encoder_hidden_state, S, C, inputs_embeds=None, decoder_inputs_embeds=None, attention_mask=None, offset=0, labels=None, **kwargs):
+        B, T = input_ids.shape
+        #if not self.training:
+            #decoder_input_ids = input_ids
+        #    decoder_input_ids = torch.zeros(B, T, dtype=torch.int64).to(input_ids.device)
+        
+        model_emb = self.model_encoder_embeddings(input_ids, inputs_embeds)
+        model_encode, encoder_hidden_state, S = self.model_encoder(model_emb, None, encoder_hidden_state, None, S, attention_mask, offset)
+        
+        loss = torch.Tensor([0])[0].to(input_ids.device)
+        
+        feedback_emb = self.feedback_encoder_embeddings(decoder_input_ids, decoder_inputs_embeds)
+        feedback_encode, _, S = self.feedback_encoder(feedback_emb, None, None, None, S, attention_mask, offset)
+        #loss += self.loss_fn(self.feedback_cls(feedback_encode).view(-1, self.config.vocab_size), decoder_input_ids.view(-1))
+        #loss += self.loss_fn(model_encode.view(-1, model_encode.shape[-1]), feedback_encode.argmax(-1).view(-1))
+        #loss += self.mse_fn(model_encode, feedback_encode)
+        #feedback_cls = self.pool_cls(feedback_encode)
+        #loss += self.loss_fn(feedback_cls, labels)
+
+        logits = self.pool_cls(model_encode)
+        loss += self.loss_fn(logits, labels)
+        #print(logits.shape, labels.shape)
+        #loss = self.loss_fn(logits.argmax(-1).float(), labels.float())
+        return COINOutputClass(
+            logits,
+            encoder_hidden_state,
+            S,
+            C,
+            loss
+        )
+
+
+class PQLossNet(nn.Module):
+    ...
+
+
 class COINForSequenceClassification(COINPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -1172,13 +1209,21 @@ class COINForSequenceClassification(COINPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         self.loss_fn = nn.CrossEntropyLoss() if self.config.num_labels <= 2 else nn.BCEWithLogitsLoss()
+        #self.acorn = nn.RNN(config.hidden_size, config.hidden_size, batch_first=True)
         self.post_init()
 
     def forward(self, input_ids, decoder_input_ids, encoder_hidden_state, S, C, inputs_embeds=None, decoder_inputs_embeds=None, attention_mask=None, offset=0, labels=None, **kwargs):
-        _, pooled_out, S, encoder_hidden_state = self.coin(input_ids, decoder_input_ids, encoder_hidden_state, S, inputs_embeds, decoder_inputs_embeds, attention_mask, offset, **kwargs)
+        out, pooled_out, S, encoder_hidden_state = self.coin(input_ids, decoder_input_ids, encoder_hidden_state, S, inputs_embeds, decoder_inputs_embeds, attention_mask, offset, **kwargs)
         logits = self.dropout(pooled_out)
         logits = self.classifier(logits)
         loss = self.loss_fn(logits, labels) if labels is not None else None
+
+        #aux_loss, _ = self.acorn(out)
+        #aux_loss = (aux_loss.sum(-1)).mean()
+        #print(aux_loss)
+        #loss += aux_loss
+        #print(loss)
+
         return COINOutputClass(
             logits,
             encoder_hidden_state,

@@ -12,7 +12,7 @@ from epoch_stats import EpochStats
 import numpy as np
 from tqdm import tqdm
 import random
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from transformers.utils import is_torch_fx_proxy
 
 
@@ -50,6 +50,69 @@ def _doc_pad(examples, max_length, pad_token=0, doc_token=4):
     return ret
 
 
+def preprocess_with_given_labels_train_test_wrap(
+    dataset, 
+    tokenizer, 
+    labels, 
+    label2id, 
+    max_length, 
+    one_label_only, 
+    num_proc=4, 
+    remove_columns=None, 
+    text_field="text", 
+    default_teacher_forcing=True,
+    #teacher_forcing_prefix="The correct label is "
+    teacher_forcing_prefix="",
+    doc_pad_tokens=False,
+    prefix=None,
+    postfix=None,
+    incontext_dict: dict=None,
+):
+    train = preprocess_with_given_labels(
+        dataset["train"], 
+        tokenizer, 
+        labels, 
+        label2id, 
+        max_length, 
+        one_label_only, 
+        num_proc, 
+        remove_columns, 
+        text_field, 
+        default_teacher_forcing,
+        #teacher_forcing_prefix="The correct label is "
+        teacher_forcing_prefix,
+        doc_pad_tokens,
+        prefix,
+        postfix,
+        True,
+        incontext_dict
+    )
+    test = preprocess_with_given_labels(
+        dataset["test"], 
+        tokenizer, 
+        labels, 
+        label2id, 
+        max_length, 
+        one_label_only, 
+        num_proc, 
+        remove_columns, 
+        text_field, 
+        default_teacher_forcing,
+        #teacher_forcing_prefix="The correct label is "
+        teacher_forcing_prefix,
+        doc_pad_tokens,
+        prefix,
+        postfix,
+        False,
+        incontext_dict
+    )
+    encoded_dataset = DatasetDict({
+        "train": train,
+        "test": test
+    })
+    return encoded_dataset
+
+
 def preprocess_with_given_labels(
     dataset, 
     tokenizer, 
@@ -64,9 +127,36 @@ def preprocess_with_given_labels(
     #teacher_forcing_prefix="The correct label is "
     teacher_forcing_prefix="",
     doc_pad_tokens=False,
+    prefix=None,
+    postfix=None,
+    train=True,
+    incontext_dict: dict=None,
 ):
+    SEPERATOR_TOKEN = "[DOC]"
+
+    if prefix is None:
+        prefix = ""
+    if postfix is None:
+        postfix = ""
     def proc(examples):
+        #text = [prefix + n + postfix for n in examples[text_field]]
         text = examples[text_field]
+        if incontext_dict is not None:
+            new_text = []
+            for text_i in text:
+                x_context = []
+                for tok in text_i.split():
+                    if tok in incontext_dict:
+                        #print("NEW CONTEXT INSERTED")
+                        x_context.append(f"{tok} is defined as {incontext_dict[tok]}")
+                new_text.append(text_i + "[SEP]" + SEPERATOR_TOKEN.join(x_context))
+            text = new_text
+            #print("NEW TEXT CREATED")
+
+        #if 0:#train :# and (random.random() > .3):
+        #    text = [f"{n} \n The correct answer is {l}." for n, l in zip(examples[text_field], examples["label"])]
+        #else:
+        #    text = [f"{n} \n What is the correct answer?" for n in examples[text_field]]
         if doc_pad_tokens:
             encoding = tokenizer(text)
             encoding = _doc_pad(encoding, max_length)
@@ -87,6 +177,66 @@ def preprocess_with_given_labels(
         return encoding
 
     return dataset.map(proc, batched=True, num_proc=num_proc, remove_columns=remove_columns)
+
+
+def preprocess_for_key_masking(
+    keys,
+    dataset, 
+    tokenizer, 
+    max_length, 
+    num_proc=4, 
+    remove_columns=None, 
+    to_mask=.15, 
+    text_field="text",
+    chance_rand_token=.2, 
+    group_texts=True, 
+    doc_token=4, 
+    udoc_token=5, 
+    mask_token=None,
+    pad_token=None, 
+    sparsify=False, 
+    prefix=None,
+    switch_ii_decoder_ii=False,
+):
+    mask_token = tokenizer.mask_token
+    vocab_size = tokenizer.vocab_size
+    to_mask = .15
+    chance_rand_token = .2
+
+    def proc(examples):
+        out_text = examples[text_field]
+        in_text = [
+            " ".join([
+                mask_token if tok in keys else tok
+                for tok in text_i.split()
+            ]) for text_i in out_text
+        ]
+
+        if group_texts:
+            encoding = tokenizer(in_text)
+            #encoding = tokenizer([" ".join(x) for x in text])
+            encoding["labels"] = tokenizer(out_text)["input_ids"]
+        else:
+            encoding = tokenizer(in_text, padding="max_length", truncation=True, max_length=max_length) # try max_length=512
+            encoding["labels"] = tokenizer(in_text, padding="max_length", truncation=True, max_length=max_length)
+    
+        if prefix is not None:
+            if group_texts:
+                prefix_tokens = tokenizer(prefix)
+            else:
+                raise NotImplementedError()
+        else:
+            prefix_tokens = None
+
+        if group_texts:
+            encoding = _group_examples(encoding, max_length, sparsify, pad_token=pad_token, prefix_tokens=prefix_tokens)
+
+        encoding["decoder_input_ids"] = encoding["labels"]
+
+        return encoding
+
+    return dataset.map(proc, batched=True, num_proc=num_proc, remove_columns=remove_columns)
+
 
 
 def _group_examples(examples, block_size, sparsify=True, pad_token=0, doc_token=4, udoc_token=5, prefix_tokens=None, num_sparse_token=1):
@@ -882,6 +1032,7 @@ def train_set_epoch(
     check_run=False,
     chomsky_task=False,
     accuracy_mask=None,
+    per_class_f1=False,
 ):
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
@@ -889,7 +1040,7 @@ def train_set_epoch(
     if masked_lm_task and vocab_size is None:
         raise ValueError("vocab_size has to be specified when training for a masked lm task")
 
-    c_train_stats = EpochStats("train", id2label, chomsky_task, accuracy_mask)
+    c_train_stats = EpochStats("train", id2label, chomsky_task, accuracy_mask, per_class_f1)
     t0 = time.time()
     if check_run:
         print("CHECK RUN")
@@ -911,7 +1062,7 @@ def train_set_epoch(
 
     last_elapse = 0
     for step, batch in enumerate(train_dataloader):
-        #print(step, print_n, len_dl)#, step % print_n)
+    #    print(step, print_n, len_dl)#, step % print_n)
         if print_status and (step % print_n == 0) and not step == 0:
             c_time = time.time()
             elapsed = c_time - t0
@@ -973,6 +1124,7 @@ def train_set_epoch(
                 S = _detach_hidden_states(S)
             if C is not None:
                 C = _detach_hidden_states(C)
+    #        print("S DETACHED")
         else:
             logits, S, C, decoder_logits, aux_loss = model(
                 S=S,
@@ -1069,6 +1221,8 @@ def train_set_epoch(
         labels = labels.detach().cpu().numpy()
         
         c_train_stats.add_score("loss", loss.item())
+        if aux_loss is not None:
+            c_train_stats.add_score("aux_loss", aux_loss.item())
         if not masked_lm_task and not electra_task and calc_metrics:
             c_train_stats.flat_metrics(logits, labels, one_label_only=one_label_only)
         loss.backward(retain_graph=retain_graph)
@@ -1119,6 +1273,7 @@ def test_set_epoch(
     chomsky_task=False,
     accuracy_mask=None,
     backprop_during_testing=False,
+    per_class_f1=False,
 ):
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
@@ -1126,10 +1281,11 @@ def test_set_epoch(
     if masked_lm_task and vocab_size is None:
         raise ValueError("vocab_size has to be specified when testing for a masked lm task")
 
-    c_test_stats = EpochStats("test", id2label, chomsky_task, accuracy_mask)
+    c_test_stats = EpochStats("test", id2label, chomsky_task, accuracy_mask, per_class_f1)
     t0 = time.time()
-    model.eval()
-
+    if not backprop_during_testing:
+        model.eval()
+    
     S, C = None, None
     encoder_hidden_state = None
 
@@ -1150,7 +1306,9 @@ def test_set_epoch(
         if (not masked_lm_task) and batch_size > 0 and model_args["input_ids"].shape[0] != batch_size:
             continue
 
-        with torch.no_grad():
+        #with torch.no_grad():
+        #if 1:
+        def model_eval(model_args, S, C, encoder_hidden_state):
             if is_hf_model:
                 outputs = model(**model_args)
                 logits = outputs.logits
@@ -1183,6 +1341,13 @@ def test_set_epoch(
                     S = _detach_hidden_states(S)
                 if C is not None:
                     C = _detach_hidden_states(C)
+            return logits, encoder_hidden_state, loss, aux_loss, S, C
+
+        if backprop_during_testing:
+            logits, encoder_hidden_state, loss, aux_loss, S, C = model_eval(model_args, S, C, encoder_hidden_state)
+        else:
+            with torch.no_grad():
+                logits, encoder_hidden_state, loss, aux_loss, S, C = model_eval(model_args, S, C, encoder_hidden_state)
 
         if loss is None:
             if backprop_during_testing:
@@ -1218,6 +1383,9 @@ def test_set_epoch(
         labels = labels.detach().cpu().numpy()
         
         c_test_stats.add_score("loss", loss.item())
+        c_test_stats.add_score("perplexity", np.exp(loss.item()))
+        if aux_loss is not None:
+            c_test_stats.add_score("aux_loss", aux_loss.item())
         if not masked_lm_task and not electra_task and calc_metrics:
             c_test_stats.flat_metrics(logits, labels, one_label_only=one_label_only)
 
@@ -1247,8 +1415,8 @@ def train_bern_model(
     scheduler,
     epochs,
     device,
-    loss_function,
-    id2label,
+    loss_function=None,
+    id2label=None,
     batch_schema: Optional[List[str]]=None,
     train_dataloader: Optional[Union[DataLoader, BatchBuffer]]=None,
     test_dataloader: Optional[Union[DataLoader, BatchBuffer]]=None,
@@ -1291,6 +1459,7 @@ def train_bern_model(
     chomsky_task=False,
     accuracy_mask=None,
     backprop_during_testing=False,
+    per_class_f1=False,
 ):
     assert train_dataloader is not None or create_train_dataloader is not None
     assert test_dataloader is not None or create_test_dataloader is not None
@@ -1359,42 +1528,52 @@ def train_bern_model(
             mlm_decode_max_batch_output,
             check_run,
             chomsky_task,
-            accuracy_mask
+            accuracy_mask,
+            per_class_f1
         )
         train_stats.append(c_train_stats)
 
-        if print_status:
-            print("\nRunning Testing...")
-        c_test_stats = test_set_epoch(
-            model,
-            optimizer,
-            scheduler,
-            test_dataloader,
-            batch_schema,
-            device,
-            loss_function,
-            id2label,
-            masked_lm_task,
-            vocab_size,
-            print_status,
-            is_hf_model,
-            test_batch_size,
-            one_label_only,
-            mlm_use if mixed_lm_task else False,
-            mixed_lm_loss_function,
-            is_encoder_decoder_model,
-            calc_metrics,
-            electra_task,
-            empty_cache,
-            batch_hack_test,
-            causal_lm,
-            generic_output_class,
-            forward_args,
-            chomsky_task,
-            accuracy_mask,
-            backprop_during_testing
-        )
-        test_stats.append(c_test_stats)
+        if not isinstance(test_dataloader, list):
+            test_dataloader = [test_dataloader]
+        if not isinstance(test_batch_size, list):
+            test_batch_size = [test_batch_size]
+        assert len(test_dataloader) == len(test_batch_size), f"{len(test_dataloader)} != {len(test_batch_size)}"
+        for i, (td, tbs) in enumerate(zip(test_dataloader, test_batch_size)):
+            if print_status:
+                print(f"\nRunning Test {i+1} ...")
+            c_test_stats = test_set_epoch(
+                model,
+                optimizer,
+                scheduler,
+                #test_dataloader,
+                td,
+                batch_schema,
+                device,
+                loss_function,
+                id2label,
+                masked_lm_task,
+                vocab_size,
+                print_status,
+                is_hf_model,
+                #test_batch_size,
+                tbs,
+                one_label_only,
+                mlm_use if mixed_lm_task else False,
+                mixed_lm_loss_function,
+                is_encoder_decoder_model,
+                calc_metrics,
+                electra_task,
+                empty_cache,
+                batch_hack_test,
+                causal_lm,
+                generic_output_class,
+                forward_args,
+                chomsky_task,
+                accuracy_mask,
+                backprop_during_testing,
+                per_class_f1
+            )
+            test_stats.append(c_test_stats)
         
         if checkpoint_path is not None:
             dump_model_to_file(

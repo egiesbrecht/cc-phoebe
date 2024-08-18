@@ -52,20 +52,21 @@ def load_moses_set(path_schema: dict[list[str]]):
     return Dataset.from_dict(ds)
 
 
-def generate_ch_batches(generate_set_fn, B, T_train, T_test, vocab_size, num_train_samples, num_test_samples, sample_method="linspace", num_warmup_steps=1000):
+def generate_ch_batches(generate_set_fn, B_train, Bs_test, T_train, Ts_test, vocab_size, num_train_samples, num_test_samples, sample_method="linspace", num_warmup_steps=1000):
     """
     sample_method = "logspace" | "uniform" | "static" | "static-warmup"
     """
+    assert len(Bs_test) == len(Ts_test), f"len({Bs_test}) != len({Ts_test})"
     #assert num_train_samples % B == 0, f"{num_train_samples} % {B} != 0"
     if sample_method == "uniform":
         #U = ((1 - (T_train / 2)) * torch.rand(num_train_samples // B) + (T_train / 2)).to(int) * 2 # ensure that (n in U) is divisible by 2
-        U = torch.FloatTensor(num_train_samples // B).uniform_(1, T_train).int()
+        U = torch.FloatTensor(num_train_samples // B_train).uniform_(1, T_train).int()
     elif sample_method == "linspace":
-        U = torch.linspace(1, T_train, num_train_samples // B, dtype=int) 
+        U = torch.linspace(1, T_train, num_train_samples // B_train, dtype=int) 
     elif sample_method == "static-warmup":
         U = torch.cat((
-            torch.linspace(1, T_train, num_warmup_steps // B, dtype=int),
-            torch.full((((num_train_samples - num_warmup_steps) // B),), T_train)
+            torch.linspace(1, T_train, num_warmup_steps // B_train, dtype=int),
+            torch.full((((num_train_samples - num_warmup_steps) // B_train),), T_train)
         ))
     elif sample_method == "static":
         U = [T_train] * num_train_samples
@@ -75,9 +76,12 @@ def generate_ch_batches(generate_set_fn, B, T_train, T_test, vocab_size, num_tra
     #print(U)
     #U += U % 2 #+ U % 4
     print("sample schema:", U)
-    train_buf = [generate_set_fn(B, n, vocab_size) for n in U]
-    test_buf = [generate_set_fn(B, T_test, vocab_size) for _ in range(num_test_samples)]
-    return train_buf, test_buf
+    train_buf = [generate_set_fn(B_train, n, vocab_size) for n in U]
+    test_bufs = [
+        [generate_set_fn(b, t, vocab_size) for _ in range(num_test_samples)]
+        for b, t in zip(Bs_test, Ts_test)
+    ]
+    return train_buf, test_bufs
 
 
 def generate_bucket_sort_set(B: int, T: int, vocab_size: int):
@@ -435,4 +439,52 @@ def generate_str_modular_arithmetic_set(B: int, T: int, vocab_size: int):
     return {
         "input_ids": equations,
         "labels": labels
-    }    
+    }
+
+
+def generate_stack_manipulation_set(B: int, T: int, vocab_size: int):
+    def _sample_exp_and_res():
+        if T == 1:
+            value = torch.randint(0, 2, (1,))
+            return value, list(value)
+        #stack_len = random.randint(1, T)
+        stack_len = T // 2
+        stack = torch.randint(0, 2, (stack_len,))
+        actions = torch.randint(2, 5, (T - stack_len,))
+        current_stack = list(stack)
+        for action in actions:
+            if action == 2: # pop
+                if current_stack:
+                    current_stack.pop()
+            elif action in (3, 4): # push 0 or 1
+                current_stack.append(action - 3)
+        return torch.cat((stack, actions), 0), current_stack[::-1]
+
+    in_size, out_size = 5, 5
+    assert vocab_size == 5
+    expressions, results = [], []
+    for _ in range(B):
+        expression, result = _sample_exp_and_res()
+        #expression = torch.cat((torch.zeros(1,), expression), 0)
+        expression = torch.cat((expression, torch.full((1,), 4)), 0)
+        expressions.append(expression)
+        result += [out_size - 1]
+        result += [0] * (T + 1 - len(result))
+        results.append(result)
+        print(len(expression), len(result))
+    #print(expressions.__class__)
+    #print(expressions)
+    return {
+        "input_ids": torch.stack(expressions),
+        "labels": torch.Tensor(results)
+    }
+
+
+def stack_manipulation_mask(target):
+    B, T = target.shape[:2]
+    termination_indices = np.argmax(
+        np.argmax(target, axis=-1),
+        axis=-1, keepdims=True
+    )
+    indices = np.tile(np.arange(T), (B, 1))
+    return indices <= termination_indices
