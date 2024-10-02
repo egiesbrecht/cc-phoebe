@@ -58,7 +58,10 @@ def generate_ch_batches(generate_set_fn, B_train, Bs_test, T_train, Ts_test, voc
     """
     assert len(Bs_test) == len(Ts_test), f"len({Bs_test}) != len({Ts_test})"
     #assert num_train_samples % B == 0, f"{num_train_samples} % {B} != 0"
-    if sample_method == "uniform":
+    if sample_method == "random":
+        rand_range = list(range(1, T_train + 1))
+        U = [random.choice(rand_range) for _ in range(num_train_samples )]
+    elif sample_method == "uniform":
         #U = ((1 - (T_train / 2)) * torch.rand(num_train_samples // B) + (T_train / 2)).to(int) * 2 # ensure that (n in U) is divisible by 2
         U = torch.FloatTensor(num_train_samples // B_train).uniform_(1, T_train).int()
     elif sample_method == "linspace":
