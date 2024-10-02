@@ -67,6 +67,7 @@ def preprocess_with_given_labels_train_test_wrap(
     prefix=None,
     postfix=None,
     incontext_dict: dict=None,
+    move_incontext_to_decoder=False,
 ):
     train = preprocess_with_given_labels(
         dataset["train"], 
@@ -85,7 +86,8 @@ def preprocess_with_given_labels_train_test_wrap(
         prefix,
         postfix,
         True,
-        incontext_dict
+        incontext_dict,
+        move_incontext_to_decoder
     )
     test = preprocess_with_given_labels(
         dataset["test"], 
@@ -104,7 +106,8 @@ def preprocess_with_given_labels_train_test_wrap(
         prefix,
         postfix,
         False,
-        incontext_dict
+        incontext_dict,
+        move_incontext_to_decoder
     )
     encoded_dataset = DatasetDict({
         "train": train,
@@ -131,8 +134,9 @@ def preprocess_with_given_labels(
     postfix=None,
     train=True,
     incontext_dict: dict=None,
+    move_incontext_to_decoder=False
 ):
-    SEPERATOR_TOKEN = "[DOC]"
+    SEPERATOR_TOKEN = "[SEP]"
 
     if prefix is None:
         prefix = ""
@@ -142,15 +146,24 @@ def preprocess_with_given_labels(
         #text = [prefix + n + postfix for n in examples[text_field]]
         text = examples[text_field]
         if incontext_dict is not None:
-            new_text = []
+            new_text, used_context_keys = [], []
             for text_i in text:
                 x_context = []
                 for tok in text_i.split():
                     if tok in incontext_dict:
                         #print("NEW CONTEXT INSERTED")
-                        x_context.append(f"{tok} is defined as {incontext_dict[tok]}")
-                new_text.append(text_i + "[SEP]" + SEPERATOR_TOKEN.join(x_context))
-            text = new_text
+                        used_context_keys.append(tok)
+                        if incontext_dict[tok] is not None:
+                            if not move_incontext_to_decoder:
+                                x_context.append(f"{tok} is defined as {incontext_dict[tok]}")
+                            else:
+                                x_context.append(incontext_dict[tok])
+                if not move_incontext_to_decoder:
+                    new_text.append(text_i + SEPERATOR_TOKEN.join(x_context))
+                else:
+                    new_text.append(x_context)
+            if not move_incontext_to_decoder:
+                text = new_text
             #print("NEW TEXT CREATED")
 
         #if 0:#train :# and (random.random() > .3):
@@ -170,13 +183,40 @@ def preprocess_with_given_labels(
             for idx, label in enumerate(labels):
                 labels_matrix[:, idx] = labels_batch[label]
             encoding["labels"] = labels_matrix.tolist()
-        if default_teacher_forcing:
-            encoding["decoder_input_ids"] = tokenizer([teacher_forcing_prefix + str(n) for n in encoding["labels"]], padding="max_length", truncation=True, max_length=max_length)["input_ids"]
+
+        num_pos_examples = 5
+        num_neg_examples = 5
+        
+        if move_incontext_to_decoder and incontext_dict is not None:
+            neg_examples_keys = [n for n in incontext_dict.keys() if n not in used_context_keys]
+            neg_examples = []
+            for _ in range(num_neg_examples):
+                val = None
+                while val is None:
+                    key = random.choice(neg_examples_keys)
+                    val = incontext_dict[key]
+                neg_examples.append(val)
+            new_text = random.choices(new_text, k=num_pos_examples)
+            pos_exp_stack = []
+            for n_t in new_text:
+                t = tokenizer(n_t, padding="max_length", truncation=True, max_length=max_length)["input_ids"]
+                #print(len(t), len(n_t))
+                pos_exp_stack.append(t)
+            neg_exp_stack = []
+            for n_t in neg_examples:
+                t = tokenizer(n_t, padding="max_length", truncation=True, max_length=max_length)["input_ids"]
+                neg_exp_stack.append(t)
+            stack_t = torch.Tensor([pos_exp_stack, neg_exp_stack])#.permute(2, 0, 1)
+            encoding["decoder_input_ids"] = stack_t.tolist()
         else:
-            encoding["decoder_input_ids"] = encoding["input_ids"].copy()
+            if default_teacher_forcing:
+                encoding["decoder_input_ids"] = tokenizer([teacher_forcing_prefix + str(n) for n in encoding["labels"]], padding="max_length", truncation=True, max_length=max_length)["input_ids"]
+            else:
+                encoding["decoder_input_ids"] = encoding["input_ids"].copy()
+            
         return encoding
 
-    return dataset.map(proc, batched=True, num_proc=num_proc, remove_columns=remove_columns)
+    return dataset.map(proc, batched=False, num_proc=1, remove_columns=remove_columns)
 
 
 def preprocess_for_key_masking(
@@ -242,22 +282,38 @@ def preprocess_for_key_masking(
 def _group_examples(examples, block_size, sparsify=True, pad_token=0, doc_token=4, udoc_token=5, prefix_tokens=None, num_sparse_token=1):
     em_prefix_tokens = prefix_tokens is None
     if em_prefix_tokens:
-        prefix_tokens = {}
+        prefix_tokens = {"group_mask": []}
     concatenated_examples = {}
     for k, v in examples.items():
         cl = []
+        group_mask = []
         for n in v:
+        #    if len(n) < 1:
+        #        continue
+        #    if sparsify:
+        #        cl += [doc_token] * num_sparse_token
+        #        group_mask += [0] * num_sparse_token # TODO: change to 1
             cl += n
+            group_mask += [1] * len(n)
             if sparsify:
-                cl += [doc_token] * num_sparse_token
+                cl += [4] * num_sparse_token # token id chosen by trail and error, don't ask me why gpt2 needs a % token as the text seperator
+                group_mask += [0] * num_sparse_token
         concatenated_examples[k] = cl
+        #if "group_mask" not in concatenated_examples.keys():
+        concatenated_examples["group_mask"] = group_mask
+        #else:
+        #    assert group_mask == concatenated_examples["group_mask"]
         if em_prefix_tokens:
             prefix_tokens[k] = []
     
+    concatenated_examples["group_mask"] = group_mask
+    num_keys = concatenated_examples.keys()
+    print("num keys:", num_keys)
+
     prefix_len = 0
     for k, t in prefix_tokens.items():
         if prefix_len > 0:
-            assert prefix_len == len(t), f"{prefix_len} {len(t)}"
+            assert prefix_len == len(t), f"{prefix_len} != {len(t)}"
         prefix_len = len(t)
     block_size -= prefix_len
 
@@ -553,7 +609,7 @@ def preprocess_for_maskedlm(
         mask_token = tokenizer.mask_token_id
     if pad_token is None:
         pad_token = tokenizer.pad_token_id
-
+    print("MASK TOKEN", mask_token)
     def proc(examples):
         text = examples[text_field]
         if group_texts:
@@ -672,8 +728,21 @@ def _shift_right(input_ids, decoder_start_token_id, pad_token_id):
     return shifted_input_ids
 
 
-def preprocess_for_causallm(dataset, tokenizer, block_size=128, num_proc=4, remove_columns=None, text_field="text", 
-    shift_right=True, decoder_start_token_id=0, pad_token_id=0
+def preprocess_for_causallm(
+    dataset, 
+    tokenizer, 
+    block_size=128, 
+    num_proc=4, 
+    remove_columns=None, 
+    text_field="text", 
+    shift_right=False, 
+    decoder_start_token_id=0, 
+    pad_token_id=0,
+    sparsify=True,
+    doc_token_id=4,
+    udoc_token_id=5,
+    num_sparse_tokens=1,
+    prefix_tokens=None
 ):
     def proc(examples):
         return tokenizer(examples[text_field])
@@ -682,11 +751,12 @@ def preprocess_for_causallm(dataset, tokenizer, block_size=128, num_proc=4, remo
     def group_texts(examples):
         examples = tokenizer(examples[text_field])
 
-        result = _group_examples(examples, block_size)
+        result = _group_examples(examples, block_size, sparsify, pad_token_id, doc_token_id, udoc_token_id, prefix_tokens, num_sparse_tokens)
 
         result["decoder_input_ids"] = result["input_ids"].copy()
         if shift_right:
-            result["labels"] = _shift_right(result["input_ids"].clone(), decoder_start_token_id, pad_token_id)
+            raise NotImplementedError()
+            #result["labels"] = _shift_right(result["input_ids"].clone(), decoder_start_token_id, pad_token_id)
         else:
             result["labels"] = result["input_ids"].copy()#.clone()
         return result
@@ -778,7 +848,15 @@ def _get_model_args(batch, batch_schema, items, device):
     return ret
 
 
-def mask_tokens(input_ids, vocab_size, to_mask=0.15, mask_token=4, return_mask_only_decoder_ids=False, chance_rand_token=0.2, ignore_up_to=4):
+def mask_tokens(
+    input_ids, 
+    vocab_size, 
+    to_mask=0.15, 
+    mask_token=4, 
+    return_mask_only_decoder_ids=False, 
+    chance_rand_token=0.2, 
+    ignore_up_to=4
+):
     """
     https://www.analyticsvidhya.com/blog/2022/09/fine-tuning-bert-with-masked-language-modeling/
     """
@@ -998,6 +1076,14 @@ def _detach_hidden_states(S):
     raise ValueError(f"S is neither a list nor a Tensor but {S.__class__}")
 
 
+from dataclasses import dataclass
+
+@dataclass
+class GenericOutput:
+    logits: Optional[torch.Tensor]
+    loss: Optional[torch.Tensor]
+
+
 def train_set_epoch(
     model: nn.Module,
     optimizer,
@@ -1024,7 +1110,7 @@ def train_set_epoch(
     imitation_model=None,
     causal_lm=False,
     generic_output_class=False,
-    forward_args=["input_ids", "token_type_ids", "attention_mask", "decoder_input_ids", "labels"],
+    forward_args=None,
     mlm_decode_n=0,
     tokenizer=None,
     mlm_decode_max_chars=100,
@@ -1034,6 +1120,9 @@ def train_set_epoch(
     accuracy_mask=None,
     per_class_f1=False,
 ):
+    if forward_args is None:
+        forward_args = batch_schema
+
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
 
@@ -1053,7 +1142,7 @@ def train_set_epoch(
     #    len_dl = len(train_dataloader) // batch_size 
     #else:
     len_dl = len(train_dataloader)
-    print_n = len_dl // 50 #if len_dl > 500 else 50
+    print_n = len_dl // 50 #if len_dl > 500 else 10
     print_n = max(1, print_n)
 
     mems = None
@@ -1081,8 +1170,7 @@ def train_set_epoch(
         #attention_mask = _get_batch_item(batch, batch_schema, "attention_mask", device)
         model_args = _get_model_args(batch, batch_schema, forward_args, device)
         #print(forward_args)
-        #print(model_args.keys())
-
+        
         if imitation_model is not None:
             with torch.no_grad():
                 labels = imitation_model(**model_args)
@@ -1124,7 +1212,8 @@ def train_set_epoch(
                 S = _detach_hidden_states(S)
             if C is not None:
                 C = _detach_hidden_states(C)
-    #        print("S DETACHED")
+            if hasattr(outputs, "labels"):
+                labels = outputs.labels  
         else:
             logits, S, C, decoder_logits, aux_loss = model(
                 S=S,
@@ -1269,12 +1358,16 @@ def test_set_epoch(
     batch_hack=False,
     causal_lm=False,
     generic_output_class=False,
-    forward_args=["input_ids", "token_type_ids", "attention_mask", "decoder_input_ids", "labels"],
+    forward_args=None,
     chomsky_task=False,
     accuracy_mask=None,
     backprop_during_testing=False,
     per_class_f1=False,
+    evaluate_autoregressively=False,
 ):
+    if forward_args is None:
+        forward_args = batch_schema
+
     if mixed_lm_task or causal_lm:
         masked_lm_task = True
     
@@ -1296,8 +1389,11 @@ def test_set_epoch(
         labels = _get_batch_item(batch, batch_schema, ("masked_input_ids" if mixed_lm_task else "labels"), device)
         model_args = _get_model_args(batch, batch_schema, forward_args, device)
 
+        if not is_hf_model:
+            model_args["is_inference"] = True
+
         # HACK: workaround if the model doesn't account for different batch sizes
-        B = model_args["input_ids"].shape[0]
+        B, T = model_args["input_ids"].shape[0:2]
         if batch_hack and batch_size > 0 and B != batch_size:
             continue
         #if batch_hack and batch_size > 0 and labels.shape != (batch_size, len(id2label)):
@@ -1306,16 +1402,30 @@ def test_set_epoch(
         if (not masked_lm_task) and batch_size > 0 and model_args["input_ids"].shape[0] != batch_size:
             continue
 
+        if evaluate_autoregressively:
+            def ag_reg(**kwargs):
+                logits = model.generate(**kwargs)
+                labels = kwargs["labels"]
+                loss_fn = nn.CrossEntropyLoss()
+                return GenericOutput(
+                    logits=logits,
+                    loss=loss_fn(logits, labels)
+                )
+            model_fn = ag_reg
+            model_args["max_new_tokens"] = T
+        else:
+            model_fn = model.__call__
+
         #with torch.no_grad():
         #if 1:
-        def model_eval(model_args, S, C, encoder_hidden_state):
+        def model_eval(model_args, S, C, encoder_hidden_state, labels):
             if is_hf_model:
-                outputs = model(**model_args)
+                outputs = model_fn(**model_args)
                 logits = outputs.logits
                 loss = outputs.loss
                 aux_loss = None
             elif generic_output_class:
-                outputs = model(
+                outputs = model_fn(
                     S=S,
                     C=C,
                     encoder_hidden_state=encoder_hidden_state,
@@ -1331,8 +1441,10 @@ def test_set_epoch(
                     S = _detach_hidden_states(S)
                 if C is not None:
                     C = _detach_hidden_states(C)
+                
+                labels = outputs.labels if hasattr(outputs, "labels") else labels
             else:
-                logits, S, C, decoder_logits, aux_loss = model(
+                logits, S, C, decoder_logits, aux_loss = model_fn(
                     S=S,
                     C=C,
                     #mems=mems, 
@@ -1341,15 +1453,15 @@ def test_set_epoch(
                     S = _detach_hidden_states(S)
                 if C is not None:
                     C = _detach_hidden_states(C)
-            return logits, encoder_hidden_state, loss, aux_loss, S, C
+            return logits, encoder_hidden_state, loss, aux_loss, S, C, labels
 
         if backprop_during_testing:
-            logits, encoder_hidden_state, loss, aux_loss, S, C = model_eval(model_args, S, C, encoder_hidden_state)
+            logits, encoder_hidden_state, loss, aux_loss, S, C, labels = model_eval(model_args, S, C, encoder_hidden_state, labels)
         else:
             with torch.no_grad():
-                logits, encoder_hidden_state, loss, aux_loss, S, C = model_eval(model_args, S, C, encoder_hidden_state)
+                logits, encoder_hidden_state, loss, aux_loss, S, C, labels = model_eval(model_args, S, C, encoder_hidden_state, labels)
 
-        if loss is None:
+        if 0:#loss is None:
             if backprop_during_testing:
                 raise ValueError("when using backprop during testing loss has to be deliviered by model output and should not be None")
             if masked_lm_task:
@@ -1383,6 +1495,7 @@ def test_set_epoch(
         labels = labels.detach().cpu().numpy()
         
         c_test_stats.add_score("loss", loss.item())
+        #if not masked_lm_task:
         c_test_stats.add_score("perplexity", np.exp(loss.item()))
         if aux_loss is not None:
             c_test_stats.add_score("aux_loss", aux_loss.item())
@@ -1448,7 +1561,7 @@ def train_bern_model(
     plot_k_topics=False,
     causal_lm=False,
     generic_output_class=False,
-    forward_args=["input_ids", "token_type_ids", "attention_mask", "decoder_input_ids", "labels"],
+    forward_args=None,
     mlm_decode_n=0,
     tokenizer=None,
     mlm_decode_max_chars=100,
@@ -1460,6 +1573,7 @@ def train_bern_model(
     accuracy_mask=None,
     backprop_during_testing=False,
     per_class_f1=False,
+    evaluate_autoregressively=False,
 ):
     assert train_dataloader is not None or create_train_dataloader is not None
     assert test_dataloader is not None or create_test_dataloader is not None
@@ -1571,7 +1685,8 @@ def train_bern_model(
                 chomsky_task,
                 accuracy_mask,
                 backprop_during_testing,
-                per_class_f1
+                per_class_f1,
+                evaluate_autoregressively
             )
             test_stats.append(c_test_stats)
         
