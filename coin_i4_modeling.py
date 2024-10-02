@@ -18,7 +18,6 @@ from rotary_embeddings import RotaryEmbedding
 from contextual_position_embeddings import CoPE
 from model_training import _shift_right, emb2idx, num_parameters, num_trainable_parameters
 from rmsnorm import RMSNorm
-from ternary_modules import BitLinear
 
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.pytorch_utils import apply_chunking_to_forward
